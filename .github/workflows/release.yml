@@ -20,7 +20,7 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: remiaft-linux-x86_64
-          - os: macos-latest
+          - os: macos-13
             target: x86_64-apple-darwin
             artifact: remiaft-macos-x86_64
           - os: windows-latest
