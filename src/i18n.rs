@@ -72,8 +72,6 @@ pub enum Text {
     JavaArgsUpdated,
     ServerArgsUpdated,
     Deleted,
-    Started,
-    Stopped,
     AutoRestart,
     Enabled,
     Disabled,
@@ -119,7 +117,9 @@ pub fn text(language: Language, key: Text) -> &'static str {
 
 fn english(key: Text) -> &'static str {
     match key {
-        Text::Help => "o console | i command | b panel | s start | x stop | n new | q quit",
+        Text::Help => {
+            "Enter select | Ctrl-S/X/R group/all selected | Ctrl-G group | m move | o console"
+        }
         Text::LanguageSaved => "language saved",
         Text::LanguagePromptTitle => "Language",
         Text::LanguagePromptBody => "Choose the interface language before using remiaft.",
@@ -165,8 +165,6 @@ fn english(key: Text) -> &'static str {
         Text::JavaArgsUpdated => "java args updated",
         Text::ServerArgsUpdated => "server args updated",
         Text::Deleted => "deleted",
-        Text::Started => "started",
-        Text::Stopped => "stopped",
         Text::AutoRestart => "auto-restart",
         Text::Enabled => "enabled",
         Text::Disabled => "disabled",
@@ -206,7 +204,7 @@ fn english(key: Text) -> &'static str {
 
 fn chinese_simplified(key: Text) -> &'static str {
     match key {
-        Text::Help => "o 控制台 | i 命令 | b 面板 | s 启动 | x 停止 | n 新建 | q 退出",
+        Text::Help => "Enter 多选 | Ctrl-S/X/R 批量 | Ctrl-G 分组 | m 移动 | o 控制台",
         Text::LanguageSaved => "语言已保存",
         Text::LanguagePromptTitle => "语言 / Language",
         Text::LanguagePromptBody => "请选择 remiaft 管理界面语言。",
@@ -250,8 +248,6 @@ fn chinese_simplified(key: Text) -> &'static str {
         Text::JavaArgsUpdated => "Java 参数已更新",
         Text::ServerArgsUpdated => "服务端参数已更新",
         Text::Deleted => "已删除",
-        Text::Started => "已启动",
-        Text::Stopped => "已停止",
         Text::AutoRestart => "自动重启",
         Text::Enabled => "已启用",
         Text::Disabled => "已禁用",

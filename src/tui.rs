@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
@@ -27,6 +28,8 @@ pub async fn run(store: ConfigStore) -> Result<()> {
 
     loop {
         app.refresh_console();
+        let size = terminal.size()?;
+        app.update_console_layout(size);
         terminal.draw(|frame| draw(frame, &app))?;
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
@@ -61,6 +64,11 @@ impl TerminalGuard {
         self.terminal.draw(f)?;
         Ok(())
     }
+
+    fn size(&self) -> Result<Rect> {
+        let size = self.terminal.size()?;
+        Ok(Rect::new(0, 0, size.width, size.height))
+    }
 }
 
 impl Drop for TerminalGuard {
@@ -84,6 +92,8 @@ enum Mode {
     EditJavaArgs,
     EditServerArgs,
     EditStartupCommand,
+    AddGroup,
+    MoveToGroup,
     Command,
 }
 
@@ -99,10 +109,24 @@ struct Draft {
     startup_command: String,
 }
 
+#[derive(Debug, Clone)]
+enum TreeItem {
+    Group(String),
+    Server(usize),
+}
+
+#[derive(Debug, Clone)]
+struct TreeRow {
+    depth: usize,
+    item: TreeItem,
+}
+
 struct App {
     store: ConfigStore,
     config: RemiaftConfig,
     selected: usize,
+    expanded_groups: HashSet<String>,
+    marked_servers: HashSet<String>,
     mode: Mode,
     language: Language,
     input: String,
@@ -112,10 +136,12 @@ struct App {
     versions: Vec<String>,
     main_view: MainView,
     show_details: bool,
+    detail_scroll: u16,
     console_server_id: Option<String>,
     console_lines: Vec<String>,
     console_end: Option<usize>,
     console_follow: bool,
+    console_wrap_width: usize,
     console_input: String,
     console_cursor: usize,
 }
@@ -123,6 +149,7 @@ struct App {
 impl App {
     fn new(store: ConfigStore) -> Result<Self> {
         let config = store.load()?;
+        let expanded_groups = config.groups.iter().map(|group| group.id.clone()).collect();
         let saved_language = config.language.as_deref().and_then(Language::from_code);
         let language = saved_language.unwrap_or(Language::English);
         let mode = if saved_language.is_some() {
@@ -134,6 +161,8 @@ impl App {
             store,
             config,
             selected: 0,
+            expanded_groups,
+            marked_servers: HashSet::new(),
             mode,
             language,
             input: String::new(),
@@ -147,10 +176,12 @@ impl App {
             versions: Vec::new(),
             main_view: MainView::Details,
             show_details: true,
+            detail_scroll: 0,
             console_server_id: None,
             console_lines: Vec::new(),
             console_end: None,
             console_follow: true,
+            console_wrap_width: 120,
             console_input: String::new(),
             console_cursor: 0,
         })
@@ -188,10 +219,27 @@ impl App {
     async fn handle_normal_key(&mut self, key: KeyEvent) -> Result<bool> {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.start_targets()?
+            }
+            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.stop_targets()?
+            }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.restart_targets()?
+            }
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.begin_add_group()
+            }
             KeyCode::Down if self.main_view == MainView::Console => self.scroll_console(1),
             KeyCode::Up if self.main_view == MainView::Console => self.scroll_console(-1),
             KeyCode::Down => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::Left => self.collapse_selected_group(),
+            KeyCode::Right => self.expand_selected_group(),
+            KeyCode::Enter => self.toggle_mark_selected(),
+            KeyCode::PageUp if self.main_view == MainView::Details => self.scroll_detail(-6),
+            KeyCode::PageDown if self.main_view == MainView::Details => self.scroll_detail(6),
             KeyCode::Char('n') => {
                 self.mode = Mode::AddName;
                 self.clear_input();
@@ -201,10 +249,10 @@ impl App {
             KeyCode::Char('s') => self.start_selected()?,
             KeyCode::Char('x') => self.stop_selected()?,
             KeyCode::Char('r') => {
-                self.stop_selected()?;
-                self.start_selected()?;
+                self.restart_targets()?;
             }
             KeyCode::Char('a') => self.toggle_auto_restart()?,
+            KeyCode::Char('m') => self.begin_move_to_group(),
             KeyCode::Char('p') => self.begin_edit_dir(),
             KeyCode::Char('j') => self.begin_edit_jar(),
             KeyCode::Char('u') => self.begin_edit_startup_command(),
@@ -429,6 +477,45 @@ impl App {
                 self.clear_input();
                 self.mode = Mode::Normal;
             }
+            Mode::AddGroup => {
+                let path = self.input.trim().to_string();
+                if !path.is_empty() {
+                    if let Some(group_id) = self.config.ensure_group_path(&path) {
+                        self.expanded_groups.insert(group_id);
+                    }
+                    self.save()?;
+                    self.status = match self.language {
+                        Language::English => format!("group created: {path}"),
+                        Language::ChineseSimplified => format!("分组已创建：{path}"),
+                    };
+                }
+                self.clear_input();
+                self.mode = Mode::Normal;
+            }
+            Mode::MoveToGroup => {
+                let path = self.input.trim().to_string();
+                let target_group_id = if path.is_empty() {
+                    None
+                } else {
+                    self.config.ensure_group_path(&path)
+                };
+                let ids = self.marked_or_selected_server_ids();
+                let count = ids.len();
+                for server in &mut self.config.servers {
+                    if ids.contains(&server.id) {
+                        server.group_id = target_group_id.clone();
+                    }
+                }
+                self.marked_servers.clear();
+                self.save()?;
+                self.status = match self.language {
+                    Language::English => format!("moved {count} server(s)"),
+                    Language::ChineseSimplified => format!("已移动 {count} 个服务器"),
+                };
+                self.clear_input();
+                self.mode = Mode::Normal;
+                self.clamp_selection();
+            }
             Mode::Command => {
                 let command = self.input.trim().to_string();
                 if !command.is_empty() {
@@ -446,7 +533,7 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let len = self.config.servers.len();
+        let len = self.visible_tree().len();
         if len == 0 {
             self.selected = 0;
             return;
@@ -456,45 +543,198 @@ impl App {
         if self.main_view == MainView::Console {
             self.reset_console_for_selection();
         }
+        self.detail_scroll = 0;
     }
 
     fn selected(&self) -> Option<&crate::config::ServerConfig> {
-        self.config.servers.get(self.selected)
+        self.selected_server_index()
+            .and_then(|index| self.config.servers.get(index))
     }
 
     fn selected_index(&self) -> Option<usize> {
-        (self.selected < self.config.servers.len()).then_some(self.selected)
+        self.selected_server_index()
     }
 
     fn selected_mut(&mut self) -> Option<&mut crate::config::ServerConfig> {
-        self.config.servers.get_mut(self.selected)
+        let index = self.selected_server_index()?;
+        self.config.servers.get_mut(index)
+    }
+
+    fn selected_server_index(&self) -> Option<usize> {
+        match self.visible_tree().get(self.selected).map(|row| &row.item) {
+            Some(TreeItem::Server(index)) => Some(*index),
+            _ => None,
+        }
+    }
+
+    fn selected_group_id(&self) -> Option<String> {
+        match self.visible_tree().get(self.selected).map(|row| &row.item) {
+            Some(TreeItem::Group(id)) => Some(id.clone()),
+            _ => None,
+        }
+    }
+
+    fn visible_tree(&self) -> Vec<TreeRow> {
+        let mut rows = Vec::new();
+        self.push_tree_children(None, 0, &mut rows);
+        rows
+    }
+
+    fn push_tree_children(&self, parent_id: Option<&str>, depth: usize, rows: &mut Vec<TreeRow>) {
+        for group in self
+            .config
+            .groups
+            .iter()
+            .filter(|group| group.parent_id.as_deref() == parent_id)
+        {
+            rows.push(TreeRow {
+                depth,
+                item: TreeItem::Group(group.id.clone()),
+            });
+            if self.expanded_groups.contains(&group.id) {
+                self.push_tree_children(Some(&group.id), depth + 1, rows);
+            }
+        }
+
+        for (index, _server) in self
+            .config
+            .servers
+            .iter()
+            .enumerate()
+            .filter(|(_, server)| {
+                let group_exists = server.group_id.as_ref().is_some_and(|group_id| {
+                    self.config.groups.iter().any(|group| &group.id == group_id)
+                });
+                server.group_id.as_deref() == parent_id || (parent_id.is_none() && !group_exists)
+            })
+        {
+            rows.push(TreeRow {
+                depth,
+                item: TreeItem::Server(index),
+            });
+        }
+    }
+
+    fn clamp_selection(&mut self) {
+        let len = self.visible_tree().len();
+        if len == 0 {
+            self.selected = 0;
+        } else {
+            self.selected = self.selected.min(len - 1);
+        }
     }
 
     fn delete_selected(&mut self) -> Result<()> {
-        if self.config.servers.is_empty() {
+        let Some(index) = self.selected_server_index() else {
             return Ok(());
-        }
-        let removed = self.config.servers.remove(self.selected);
-        self.selected = self.selected.saturating_sub(1);
+        };
+        let removed = self.config.servers.remove(index);
+        self.marked_servers.remove(&removed.id);
+        self.clamp_selection();
         self.save()?;
         self.status = format!("{} {}", self.t(Text::Deleted), removed.name);
         Ok(())
     }
 
     fn start_selected(&mut self) -> Result<()> {
-        if let Some(server) = self.selected() {
-            process::start_supervisor(&self.store, server)?;
-            self.status = format!("{} {}", self.t(Text::Started), server.name);
-        }
-        Ok(())
+        self.start_targets()
     }
 
     fn stop_selected(&mut self) -> Result<()> {
-        if let Some(server) = self.selected() {
+        self.stop_targets()
+    }
+
+    fn restart_targets(&mut self) -> Result<()> {
+        let servers = self.target_servers();
+        for server in &servers {
             process::stop_server(&self.store, server)?;
-            self.status = format!("{} {}", self.t(Text::Stopped), server.name);
         }
+        for server in &servers {
+            process::start_supervisor(&self.store, server)?;
+        }
+        self.status = match self.language {
+            Language::English => format!("restarted {} server(s)", servers.len()),
+            Language::ChineseSimplified => format!("已重启 {} 个服务器", servers.len()),
+        };
         Ok(())
+    }
+
+    fn start_targets(&mut self) -> Result<()> {
+        let servers = self.target_servers();
+        for server in &servers {
+            process::start_supervisor(&self.store, server)?;
+        }
+        self.status = match self.language {
+            Language::English => format!("started {} server(s)", servers.len()),
+            Language::ChineseSimplified => format!("已启动 {} 个服务器", servers.len()),
+        };
+        Ok(())
+    }
+
+    fn stop_targets(&mut self) -> Result<()> {
+        let servers = self.target_servers();
+        for server in &servers {
+            process::stop_server(&self.store, server)?;
+        }
+        self.status = match self.language {
+            Language::English => format!("stopped {} server(s)", servers.len()),
+            Language::ChineseSimplified => format!("已停止 {} 个服务器", servers.len()),
+        };
+        Ok(())
+    }
+
+    fn target_servers(&self) -> Vec<crate::config::ServerConfig> {
+        let ids = self.marked_or_selected_server_ids();
+        self.config
+            .servers
+            .iter()
+            .filter(|server| ids.contains(&server.id))
+            .cloned()
+            .collect()
+    }
+
+    fn marked_or_selected_server_ids(&self) -> Vec<String> {
+        if !self.marked_servers.is_empty() {
+            return self
+                .config
+                .servers
+                .iter()
+                .filter(|server| self.marked_servers.contains(&server.id))
+                .map(|server| server.id.clone())
+                .collect();
+        }
+        if let Some(server) = self.selected() {
+            return vec![server.id.clone()];
+        }
+        if let Some(group_id) = self.selected_group_id() {
+            return self.server_ids_in_group(&group_id);
+        }
+        Vec::new()
+    }
+
+    fn server_ids_in_group(&self, group_id: &str) -> Vec<String> {
+        let mut ids = Vec::new();
+        self.collect_server_ids_in_group(group_id, &mut ids);
+        ids
+    }
+
+    fn collect_server_ids_in_group(&self, group_id: &str, ids: &mut Vec<String>) {
+        for server in self
+            .config
+            .servers
+            .iter()
+            .filter(|server| server.group_id.as_deref() == Some(group_id))
+        {
+            ids.push(server.id.clone());
+        }
+        for child in self
+            .config
+            .groups
+            .iter()
+            .filter(|group| group.parent_id.as_deref() == Some(group_id))
+        {
+            self.collect_server_ids_in_group(&child.id, ids);
+        }
     }
 
     fn toggle_auto_restart(&mut self) -> Result<()> {
@@ -513,6 +753,76 @@ impl App {
             );
         }
         Ok(())
+    }
+
+    fn toggle_mark_selected(&mut self) {
+        let Some(row) = self.visible_tree().get(self.selected).cloned() else {
+            return;
+        };
+        match row.item {
+            TreeItem::Server(index) => {
+                if let Some(server) = self.config.servers.get(index) {
+                    if !self.marked_servers.remove(&server.id) {
+                        self.marked_servers.insert(server.id.clone());
+                    }
+                }
+            }
+            TreeItem::Group(group_id) => {
+                let ids = self.server_ids_in_group(&group_id);
+                let all_marked = ids.iter().all(|id| self.marked_servers.contains(id));
+                if all_marked {
+                    for id in ids {
+                        self.marked_servers.remove(&id);
+                    }
+                } else {
+                    self.marked_servers.extend(ids);
+                }
+            }
+        }
+    }
+
+    fn expand_selected_group(&mut self) {
+        if let Some(group_id) = self.selected_group_id() {
+            self.expanded_groups.insert(group_id);
+        }
+    }
+
+    fn collapse_selected_group(&mut self) {
+        if let Some(group_id) = self.selected_group_id() {
+            self.expanded_groups.remove(&group_id);
+            self.clamp_selection();
+        }
+    }
+
+    fn scroll_detail(&mut self, delta: isize) {
+        if delta < 0 {
+            self.detail_scroll = self
+                .detail_scroll
+                .saturating_sub(delta.unsigned_abs() as u16);
+        } else {
+            self.detail_scroll = self.detail_scroll.saturating_add(delta as u16);
+        }
+    }
+
+    fn begin_add_group(&mut self) {
+        self.clear_input();
+        self.mode = Mode::AddGroup;
+        self.status = match self.language {
+            Language::English => "new group path, like proxy/velocity:".to_string(),
+            Language::ChineseSimplified => "新分组路径，例如 proxy/velocity：".to_string(),
+        };
+    }
+
+    fn begin_move_to_group(&mut self) {
+        if self.marked_or_selected_server_ids().is_empty() {
+            return;
+        }
+        self.clear_input();
+        self.mode = Mode::MoveToGroup;
+        self.status = match self.language {
+            Language::English => "move to group path; blank moves to root:".to_string(),
+            Language::ChineseSimplified => "移动到分组路径；留空移动到根目录：".to_string(),
+        };
     }
 
     fn begin_edit_dir(&mut self) {
@@ -641,17 +951,16 @@ impl App {
         if self.main_view != MainView::Console {
             return;
         }
+        let visual_len = self.console_visual_len();
         if delta < 0 {
-            let end = self.console_end.unwrap_or(self.console_lines.len());
+            let end = self.console_end.unwrap_or(visual_len);
             self.console_end = Some(end.saturating_sub(delta.unsigned_abs()).max(1));
             self.console_follow = false;
             self.status = self.t(Text::ConsolePaused).to_string();
         } else {
-            let end = self.console_end.unwrap_or(self.console_lines.len());
-            let next = end
-                .saturating_add(delta as usize)
-                .min(self.console_lines.len());
-            if next >= self.console_lines.len() {
+            let end = self.console_end.unwrap_or(visual_len);
+            let next = end.saturating_add(delta as usize).min(visual_len);
+            if next >= visual_len {
                 self.console_follow = true;
                 self.console_end = None;
                 self.status = self.t(Text::ConsoleFollow).to_string();
@@ -666,6 +975,23 @@ impl App {
         self.console_lines.clear();
         self.console_end = None;
         self.console_follow = true;
+    }
+
+    fn set_console_wrap_width(&mut self, width: usize) {
+        let width = width.max(1);
+        if self.console_wrap_width != width {
+            self.console_wrap_width = width;
+            if !self.console_follow {
+                let visual_len = self.console_visual_len();
+                self.console_end = self.console_end.map(|end| end.min(visual_len).max(1));
+            }
+        }
+    }
+
+    fn console_visual_len(&self) -> usize {
+        wrap_console_lines(&self.console_lines, self.console_wrap_width)
+            .len()
+            .max(self.console_lines.len().min(1))
     }
 
     fn refresh_console(&mut self) {
@@ -692,7 +1018,7 @@ impl App {
         if self.console_follow {
             self.console_end = None;
         } else {
-            let len = self.console_lines.len();
+            let len = self.console_visual_len();
             self.console_end = self.console_end.map(|end| end.min(len).max(1));
         }
     }
@@ -769,6 +1095,43 @@ impl App {
     fn clear_console_input(&mut self) {
         self.console_input.clear();
         self.console_cursor = 0;
+    }
+
+    fn update_console_layout(&mut self, area: Rect) {
+        if self.main_view != MainView::Console {
+            return;
+        }
+        let header_height = if area.height >= 8 { 3 } else { 1 };
+        let footer_height = if area.height >= 10 { 3 } else { 1 };
+        let body_height = area
+            .height
+            .saturating_sub(header_height)
+            .saturating_sub(footer_height);
+        let console_header_height = if body_height < 6 {
+            0
+        } else if body_height >= 12 {
+            5
+        } else if body_height >= 8 {
+            3
+        } else {
+            0
+        };
+        let console_height = body_height.saturating_sub(console_header_height);
+        let input_height = if console_height >= 6 {
+            3
+        } else if console_height >= 3 {
+            1
+        } else {
+            0
+        };
+        let log_height = console_height.saturating_sub(input_height);
+        let bordered = log_height >= 3 && area.width >= 4;
+        let width = if bordered {
+            area.width.saturating_sub(2).max(1)
+        } else {
+            area.width.max(1)
+        };
+        self.set_console_wrap_width(width as usize);
     }
 
     fn t(&self, key: Text) -> &'static str {
@@ -990,32 +1353,81 @@ fn draw_language_select(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_server_list(frame: &mut Frame, app: &App, area: Rect) {
-    let items = if app.config.servers.is_empty() {
+    let rows = app.visible_tree();
+    let items = if rows.is_empty() {
         vec![ListItem::new(app.t(Text::NoServers))]
     } else {
-        app.config
-            .servers
-            .iter()
-            .map(|server| {
-                let status = process::runtime_status(&app.store, server);
-                let color = match status {
-                    process::RuntimeStatus::Running => Color::Green,
-                    process::RuntimeStatus::Stopped => Color::Gray,
-                    process::RuntimeStatus::Stale => Color::Yellow,
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("{:<8}", status_label(app, status)),
-                        Style::default().fg(color),
-                    ),
-                    Span::raw(format!(" {}", server.name)),
-                ]))
+        rows.iter()
+            .map(|row| match &row.item {
+                TreeItem::Group(group_id) => {
+                    let group = app.config.groups.iter().find(|group| &group.id == group_id);
+                    let name = group.map(|group| group.name.as_str()).unwrap_or("group");
+                    let ids = app.server_ids_in_group(group_id);
+                    let running = ids
+                        .iter()
+                        .filter(|id| {
+                            app.config
+                                .servers
+                                .iter()
+                                .find(|server| &server.id == *id)
+                                .map(|server| {
+                                    process::runtime_status(&app.store, server)
+                                        == process::RuntimeStatus::Running
+                                })
+                                .unwrap_or(false)
+                        })
+                        .count();
+                    let selected =
+                        !ids.is_empty() && ids.iter().all(|id| app.marked_servers.contains(id));
+                    let icon = if app.expanded_groups.contains(group_id) {
+                        "[-]"
+                    } else {
+                        "[+]"
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::raw("  ".repeat(row.depth)),
+                        Span::styled(
+                            if selected { "[x] " } else { "[ ] " },
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Span::styled(icon, Style::default().fg(Color::Yellow)),
+                        Span::styled(
+                            format!(" {name}"),
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(format!(" ({running}/{})", ids.len())),
+                    ]))
+                }
+                TreeItem::Server(index) => {
+                    let Some(server) = app.config.servers.get(*index) else {
+                        return ListItem::new("");
+                    };
+                    let status = process::runtime_status(&app.store, server);
+                    let color = match status {
+                        process::RuntimeStatus::Running => Color::Green,
+                        process::RuntimeStatus::Stopped => Color::Gray,
+                        process::RuntimeStatus::Stale => Color::Yellow,
+                    };
+                    let selected = app.marked_servers.contains(&server.id);
+                    ListItem::new(Line::from(vec![
+                        Span::raw("  ".repeat(row.depth)),
+                        Span::styled(
+                            if selected { "[x] " } else { "[ ] " },
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Span::styled(
+                            format!("{:<8}", status_label(app, status)),
+                            Style::default().fg(color),
+                        ),
+                        Span::raw(format!(" {}", server.name)),
+                    ]))
+                }
             })
             .collect()
     };
 
     let mut state = ListState::default();
-    if !app.config.servers.is_empty() {
+    if !rows.is_empty() {
         state.select(Some(app.selected));
     }
 
@@ -1036,8 +1448,15 @@ fn draw_server_list(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     let text = if let Some(server) = app.selected() {
         vec![
-            Line::from(format!("{}: {}", app.t(Text::Name), server.name)),
-            Line::from(format!("{}: {}", app.t(Text::Id), server.id)),
+            Line::from(vec![
+                Span::styled(
+                    format!("{}: {}", app.t(Text::Name), server.name),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("  {}: {}", app.t(Text::Id), server.id)),
+            ]),
             Line::from(format!(
                 "{}: {}",
                 app.t(Text::Directory),
@@ -1049,9 +1468,16 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
                 server.jar_path.display()
             )),
             Line::from(format!(
-                "{}: {}",
+                "{}: {} | {}: {}M-{}M | {}: {} | {}: {}s",
                 app.t(Text::JavaPath),
-                server.java_bin(&app.config.java_path)
+                server.java_bin(&app.config.java_path),
+                app.t(Text::Memory),
+                server.min_memory_mb,
+                server.max_memory_mb,
+                app.t(Text::AutoRestartField),
+                server.auto_restart,
+                app.t(Text::RestartDelay),
+                server.restart_delay_secs
             )),
             Line::from(format!(
                 "{}: {}",
@@ -1060,12 +1486,6 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
                     .startup_command
                     .clone()
                     .unwrap_or_else(|| server.startup_command(&app.config.java_path))
-            )),
-            Line::from(format!(
-                "{}: {}M - {}M",
-                app.t(Text::Memory),
-                server.min_memory_mb,
-                server.max_memory_mb
             )),
             Line::from(format!(
                 "{}: {}",
@@ -1077,16 +1497,6 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
                 app.t(Text::ServerArgs),
                 server.server_args.join(" ")
             )),
-            Line::from(format!(
-                "{}: {}",
-                app.t(Text::AutoRestartField),
-                server.auto_restart
-            )),
-            Line::from(format!(
-                "{}: {}s",
-                app.t(Text::RestartDelay),
-                server.restart_delay_secs
-            )),
             Line::from(""),
             Line::from(format!("{}:", app.t(Text::RecentVersions))),
         ]
@@ -1097,6 +1507,52 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
                 .map(|line| Line::from(format!("  {line}"))),
         )
         .collect()
+    } else if let Some(group_id) = app.selected_group_id() {
+        let name = app
+            .config
+            .groups
+            .iter()
+            .find(|group| group.id == group_id)
+            .map(|group| group.name.as_str())
+            .unwrap_or("group");
+        let ids = app.server_ids_in_group(&group_id);
+        let running = ids
+            .iter()
+            .filter(|id| {
+                app.config
+                    .servers
+                    .iter()
+                    .find(|server| &server.id == *id)
+                    .map(|server| {
+                        process::runtime_status(&app.store, server)
+                            == process::RuntimeStatus::Running
+                    })
+                    .unwrap_or(false)
+            })
+            .count();
+        vec![
+            Line::from(Span::styled(
+                format!("{}: {name}", app.t(Text::SelectedServer)),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(format!("ID: {group_id}")),
+            Line::from(match app.language {
+                Language::English => format!("Servers: {} total, {running} running", ids.len()),
+                Language::ChineseSimplified => {
+                    format!("服务器：共 {} 个，运行中 {running} 个", ids.len())
+                }
+            }),
+            Line::from(match app.language {
+                Language::English => "Enter selects all servers in this group recursively.",
+                Language::ChineseSimplified => "Enter 会递归选择该分组下的全部服务器。",
+            }),
+            Line::from(match app.language {
+                Language::English => "Ctrl-S/Ctrl-X/Ctrl-R start, stop, or restart the group.",
+                Language::ChineseSimplified => "Ctrl-S/Ctrl-X/Ctrl-R 可启动、停止或重启该分组。",
+            }),
+        ]
     } else {
         vec![
             Line::from(app.t(Text::AddServerHint)),
@@ -1110,6 +1566,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
                 .borders(Borders::ALL)
                 .title(app.t(Text::Details)),
         )
+        .scroll((app.detail_scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -1213,40 +1670,6 @@ fn draw_console_input(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_quick_panel(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines = Vec::new();
     lines.push(Line::from(Span::styled(
-        app.t(Text::SelectedServer),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )));
-
-    if let Some(server) = app.selected() {
-        let status = process::runtime_status(&app.store, server);
-        lines.push(Line::from(format!(
-            "{}: {}",
-            app.t(Text::Name),
-            server.name
-        )));
-        lines.push(Line::from(format!(
-            "{}: {}",
-            app.t(Text::Jar),
-            server.jar_path.display()
-        )));
-        lines.push(Line::from(format!(
-            "{}: {}",
-            app.t(Text::Directory),
-            server.directory.display()
-        )));
-        lines.push(Line::from(format!(
-            "{}: {}",
-            app.t(Text::Status),
-            status_label(app, status)
-        )));
-    } else {
-        lines.push(Line::from(app.t(Text::NoServerSelected)));
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
         app.t(Text::Shortcuts),
         Style::default()
             .fg(Color::Cyan)
@@ -1272,6 +1695,11 @@ fn shortcut_lines(app: &App) -> Vec<Line<'static>> {
     match app.language {
         Language::English => vec![
             Line::from("n  new server"),
+            Line::from("Ctrl-G  new group"),
+            Line::from("Enter  select item"),
+            Line::from("Left/Right  fold group"),
+            Line::from("m  move selected to group"),
+            Line::from("Ctrl-S/X/R  selected/group"),
             Line::from("o  console/details"),
             Line::from("i  send command"),
             Line::from("b  side panel"),
@@ -1294,6 +1722,11 @@ fn shortcut_lines(app: &App) -> Vec<Line<'static>> {
         ],
         Language::ChineseSimplified => vec![
             Line::from("n  新建服务器"),
+            Line::from("Ctrl-G  新建分组"),
+            Line::from("Enter  选择项目"),
+            Line::from("←/→  折叠/展开分组"),
+            Line::from("m  移动到分组"),
+            Line::from("Ctrl-S/X/R  批量操作"),
             Line::from("o  控制台/详情"),
             Line::from("i  发送命令"),
             Line::from("b  侧栏面板"),
@@ -1332,6 +1765,14 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         Mode::EditJavaArgs => app.t(Text::InputEditJavaArgs),
         Mode::EditStartupCommand => app.t(Text::StartupCommand),
         Mode::EditServerArgs => app.t(Text::InputEditServerArgs),
+        Mode::AddGroup => match app.language {
+            Language::English => "New group path",
+            Language::ChineseSimplified => "新分组路径",
+        },
+        Mode::MoveToGroup => match app.language {
+            Language::English => "Move to group",
+            Language::ChineseSimplified => "移动到分组",
+        },
         Mode::Command => app.t(Text::InputSendCommand),
         Mode::LanguageSelect | Mode::Normal => "",
     };

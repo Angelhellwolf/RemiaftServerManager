@@ -73,6 +73,8 @@ pub struct RemiaftConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
     pub java_path: String,
+    #[serde(default)]
+    pub groups: Vec<ServerGroup>,
     pub servers: Vec<ServerConfig>,
 }
 
@@ -81,6 +83,7 @@ impl Default for RemiaftConfig {
         Self {
             language: None,
             java_path: "java".to_string(),
+            groups: Vec::new(),
             servers: Vec::new(),
         }
     }
@@ -92,6 +95,7 @@ impl RemiaftConfig {
         self.servers.push(ServerConfig {
             id,
             name,
+            group_id: None,
             directory,
             startup_command: None,
             jar_path,
@@ -111,6 +115,36 @@ impl RemiaftConfig {
             .iter()
             .find(|server| server.id == key || server.name == key)
             .ok_or_else(|| anyhow!("unknown server: {key}"))
+    }
+
+    pub fn ensure_group_path(&mut self, path: &str) -> Option<String> {
+        let mut parent_id: Option<String> = None;
+        let mut last_id = None;
+        for name in path
+            .split('/')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+        {
+            let existing = self
+                .groups
+                .iter()
+                .find(|group| group.parent_id == parent_id && group.name == name)
+                .map(|group| group.id.clone());
+            let id = if let Some(id) = existing {
+                id
+            } else {
+                let id = format!("{}-{}", slug(name), &Uuid::new_v4().to_string()[..8]);
+                self.groups.push(ServerGroup {
+                    id: id.clone(),
+                    name: name.to_string(),
+                    parent_id: parent_id.clone(),
+                });
+                id
+            };
+            parent_id = Some(id.clone());
+            last_id = Some(id);
+        }
+        last_id
     }
 
     fn normalize_startup_commands(&mut self) -> bool {
@@ -147,9 +181,19 @@ impl RemiaftConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerGroup {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
     pub directory: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_command: Option<String>,
