@@ -194,10 +194,17 @@ impl App {
                 self.status = self.t(Text::Cancelled).to_string();
             }
             KeyCode::Enter => self.commit_input()?,
-            KeyCode::Backspace => {
+            KeyCode::Backspace | KeyCode::Char('h')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.code == KeyCode::Backspace =>
+            {
                 self.input.pop();
             }
-            KeyCode::Char(ch) => self.input.push(ch),
+            KeyCode::Char(ch)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                self.input.push(ch);
+            }
             _ => {}
         }
         Ok(false)
@@ -467,12 +474,26 @@ fn draw(frame: &mut Frame, app: &App) {
     .block(Block::default().borders(Borders::ALL));
     frame.render_widget(header, chunks[0]);
 
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(chunks[1]);
+    let body = if chunks[1].width >= 120 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(34),
+                Constraint::Percentage(46),
+                Constraint::Percentage(20),
+            ])
+            .split(chunks[1])
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(chunks[1])
+    };
     draw_server_list(frame, app, body[0]);
     draw_detail(frame, app, body[1]);
+    if body.len() > 2 {
+        draw_quick_panel(frame, app, body[2]);
+    }
 
     let footer = Paragraph::new(app.status.as_str())
         .block(
@@ -632,6 +653,99 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+fn draw_quick_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        app.t(Text::SelectedServer),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    if let Some(server) = app.selected() {
+        let status = process::runtime_status(&app.store, server);
+        lines.push(Line::from(format!(
+            "{}: {}",
+            app.t(Text::Name),
+            server.name
+        )));
+        lines.push(Line::from(format!(
+            "{}: {}",
+            app.t(Text::Jar),
+            server.jar_path.display()
+        )));
+        lines.push(Line::from(format!(
+            "{}: {}",
+            app.t(Text::Directory),
+            server.directory.display()
+        )));
+        lines.push(Line::from(format!(
+            "{}: {}",
+            app.t(Text::Status),
+            status_label(app, status)
+        )));
+    } else {
+        lines.push(Line::from(app.t(Text::NoServerSelected)));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        app.t(Text::Shortcuts),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.extend(shortcut_lines(app));
+    lines.push(Line::from(""));
+    lines.push(Line::from(app.t(Text::ManagerExitHint)));
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(app.t(Text::QuickPanel)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
+fn shortcut_lines(app: &App) -> Vec<Line<'static>> {
+    match app.language {
+        Language::English => vec![
+            Line::from("n  new server"),
+            Line::from("s  start"),
+            Line::from("x  stop"),
+            Line::from("r  restart"),
+            Line::from("c  console command"),
+            Line::from("a  auto-restart"),
+            Line::from("e  Java args"),
+            Line::from("g  server args"),
+            Line::from("p  directory"),
+            Line::from("j  jar path"),
+            Line::from("v  versions"),
+            Line::from("l  language"),
+            Line::from("d  delete"),
+            Line::from("q  quit UI"),
+        ],
+        Language::ChineseSimplified => vec![
+            Line::from("n  新建服务器"),
+            Line::from("s  启动"),
+            Line::from("x  停止"),
+            Line::from("r  重启"),
+            Line::from("c  控制台命令"),
+            Line::from("a  自动重启"),
+            Line::from("e  Java 参数"),
+            Line::from("g  服务端参数"),
+            Line::from("p  服务器目录"),
+            Line::from("j  Jar 路径"),
+            Line::from("v  版本列表"),
+            Line::from("l  语言"),
+            Line::from("d  删除"),
+            Line::from("q  退出界面"),
+        ],
+    }
 }
 
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
