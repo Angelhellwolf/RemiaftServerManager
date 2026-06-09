@@ -2,6 +2,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::ptr;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -13,6 +15,8 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::config::{ConfigStore, ServerConfig};
 
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
@@ -129,6 +133,7 @@ pub fn run_supervisor(store: &ConfigStore, server_id: &str) -> Result<()> {
     }
 }
 
+#[cfg(unix)]
 fn run_server_once(
     store: &ConfigStore,
     default_java: &str,
@@ -141,6 +146,106 @@ fn run_server_once(
         ));
     }
 
+    fs::write(command_path(store, server), b"")?;
+
+    let (master, slave_fd) = open_pty()?;
+    set_nonblocking(&master)?;
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let stdin = slave.try_clone()?;
+    let stdout = slave.try_clone()?;
+    let stderr = slave.try_clone()?;
+
+    let mut command = Command::new(server.java_bin(default_java));
+    command
+        .current_dir(&server.directory)
+        .args(java_args(server))
+        .env("TERM", "xterm-256color")
+        .env("COLORTERM", "truecolor")
+        .env("CLICOLOR_FORCE", "1")
+        .stdin(Stdio::from(stdin))
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("spawn Minecraft server {}", server.name))?;
+    drop(slave);
+
+    fs::write(child_pid_path(store, server), child.id().to_string())?;
+    let done = Arc::new(AtomicBool::new(false));
+    let command_done = Arc::clone(&done);
+    let command_file = command_path(store, server);
+    let mut master_writer = master.try_clone()?;
+    let command_thread = thread::spawn(move || {
+        let mut offset = 0;
+        while !command_done.load(Ordering::Relaxed) {
+            if let Ok(new_offset) =
+                pump_terminal_commands(&command_file, offset, &mut master_writer)
+            {
+                offset = new_offset;
+            }
+            thread::sleep(Duration::from_millis(300));
+        }
+    });
+
+    let output_done = Arc::clone(&done);
+    let mut master_reader = master;
+    let mut log = append_file(&minecraft_log_path(store, server))?;
+    let output_thread = thread::spawn(move || {
+        let mut buf = [0_u8; 8192];
+        loop {
+            match master_reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let _ = log.write_all(&buf[..n]);
+                    let _ = log.flush();
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if output_done.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let status = child.wait().context("wait Minecraft server")?;
+    done.store(true, Ordering::Relaxed);
+    let _ = command_thread.join();
+    let _ = output_thread.join();
+    let _ = fs::remove_file(child_pid_path(store, server));
+    Ok(status.code())
+}
+
+#[cfg(not(unix))]
+fn run_server_once(
+    store: &ConfigStore,
+    default_java: &str,
+    server: &ServerConfig,
+) -> Result<Option<i32>> {
+    if !server.directory.exists() {
+        return Err(anyhow!(
+            "server directory does not exist: {}",
+            server.directory.display()
+        ));
+    }
+
+    fs::write(command_path(store, server), b"")?;
     let log = append_file(&minecraft_log_path(store, server))?;
     let stderr = log.try_clone()?;
 
@@ -187,6 +292,7 @@ fn java_args(server: &ServerConfig) -> Vec<String> {
     args
 }
 
+#[cfg(not(unix))]
 fn pump_commands(path: &Path, offset: u64, stdin: &mut impl Write) -> Result<u64> {
     if !path.exists() {
         return Ok(offset);
@@ -200,6 +306,62 @@ fn pump_commands(path: &Path, offset: u64, stdin: &mut impl Write) -> Result<u64
         stdin.flush()?;
     }
     Ok(offset + buf.len() as u64)
+}
+
+#[cfg(unix)]
+fn pump_terminal_commands(path: &Path, offset: u64, terminal: &mut impl Write) -> Result<u64> {
+    if !path.exists() {
+        return Ok(offset);
+    }
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf)?;
+    if !buf.is_empty() {
+        let terminal_input = buf.replace('\n', "\r");
+        terminal.write_all(terminal_input.as_bytes())?;
+        terminal.flush()?;
+    }
+    Ok(offset + buf.len() as u64)
+}
+
+#[cfg(unix)]
+fn open_pty() -> Result<(File, i32)> {
+    let mut master_fd = 0;
+    let mut slave_fd = 0;
+    let size = libc::winsize {
+        ws_row: 40,
+        ws_col: 160,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let rc = unsafe {
+        libc::openpty(
+            &mut master_fd,
+            &mut slave_fd,
+            ptr::null_mut(),
+            ptr::null(),
+            &size,
+        )
+    };
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error()).context("open pty");
+    }
+    Ok((unsafe { File::from_raw_fd(master_fd) }, slave_fd))
+}
+
+#[cfg(unix)]
+fn set_nonblocking(file: &File) -> Result<()> {
+    let fd = file.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error()).context("read pty flags");
+    }
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error()).context("set pty nonblocking");
+    }
+    Ok(())
 }
 
 fn cleanup_runtime(store: &ConfigStore, server: &ServerConfig) {

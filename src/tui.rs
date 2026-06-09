@@ -225,10 +225,12 @@ impl App {
 
     async fn handle_console_key(&mut self, key: KeyEvent) -> Result<bool> {
         match key.code {
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.leave_console();
+            }
             KeyCode::Esc => {
                 if self.console_input.is_empty() {
-                    self.main_view = MainView::Details;
-                    self.status = self.t(Text::Help).to_string();
+                    self.leave_console();
                 } else {
                     self.console_input.clear();
                 }
@@ -580,10 +582,15 @@ impl App {
                 }
             }
             MainView::Console => {
-                self.main_view = MainView::Details;
-                self.status = self.t(Text::Help).to_string();
+                self.leave_console();
             }
         }
+    }
+
+    fn leave_console(&mut self) {
+        self.main_view = MainView::Details;
+        self.console_input.clear();
+        self.status = self.t(Text::Help).to_string();
     }
 
     fn toggle_details(&mut self) {
@@ -687,7 +694,7 @@ impl App {
         let start = end.saturating_sub(height);
         self.console_lines[start..end]
             .iter()
-            .map(|line| Line::from(line.clone()))
+            .map(|line| ansi_to_line(line))
             .collect()
     }
 
@@ -1307,6 +1314,127 @@ fn looks_like_java_bin(value: &str) -> bool {
     name == "java" || name.starts_with("java")
 }
 
+fn ansi_to_line(input: &str) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut text = String::new();
+    let mut style = Style::default();
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            let mut sequence = String::new();
+            let mut final_char = None;
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    final_char = Some(next);
+                    break;
+                }
+                sequence.push(next);
+            }
+
+            if final_char == Some('m') {
+                push_ansi_span(&mut spans, &mut text, style);
+                apply_sgr(&mut style, &sequence);
+            }
+            continue;
+        }
+
+        if ch != '\r' {
+            text.push(ch);
+        }
+    }
+
+    push_ansi_span(&mut spans, &mut text, style);
+    if spans.is_empty() {
+        Line::from("")
+    } else {
+        Line::from(spans)
+    }
+}
+
+fn push_ansi_span(spans: &mut Vec<Span<'static>>, text: &mut String, style: Style) {
+    if !text.is_empty() {
+        spans.push(Span::styled(std::mem::take(text), style));
+    }
+}
+
+fn apply_sgr(style: &mut Style, sequence: &str) {
+    let values = if sequence.trim().is_empty() {
+        vec![0]
+    } else {
+        sequence
+            .split(';')
+            .map(|part| part.parse::<u16>().unwrap_or(0))
+            .collect::<Vec<_>>()
+    };
+
+    let mut index = 0;
+    while index < values.len() {
+        match values[index] {
+            0 => *style = Style::default(),
+            1 => *style = style.add_modifier(Modifier::BOLD),
+            3 => *style = style.add_modifier(Modifier::ITALIC),
+            4 => *style = style.add_modifier(Modifier::UNDERLINED),
+            30..=37 => *style = style.fg(ansi_color(values[index] - 30, false)),
+            39 => *style = style.fg(Color::Reset),
+            40..=47 => *style = style.bg(ansi_color(values[index] - 40, false)),
+            49 => *style = style.bg(Color::Reset),
+            90..=97 => *style = style.fg(ansi_color(values[index] - 90, true)),
+            100..=107 => *style = style.bg(ansi_color(values[index] - 100, true)),
+            38 | 48 => {
+                if let Some((color, consumed)) = parse_extended_color(&values[index + 1..]) {
+                    if values[index] == 38 {
+                        *style = style.fg(color);
+                    } else {
+                        *style = style.bg(color);
+                    }
+                    index += consumed;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+}
+
+fn parse_extended_color(values: &[u16]) -> Option<(Color, usize)> {
+    match values {
+        [5, color, ..] => Some((Color::Indexed((*color).min(255) as u8), 2)),
+        [2, red, green, blue, ..] => Some((
+            Color::Rgb(
+                (*red).min(255) as u8,
+                (*green).min(255) as u8,
+                (*blue).min(255) as u8,
+            ),
+            4,
+        )),
+        _ => None,
+    }
+}
+
+fn ansi_color(code: u16, bright: bool) -> Color {
+    match (code, bright) {
+        (0, false) => Color::Black,
+        (1, false) => Color::Red,
+        (2, false) => Color::Green,
+        (3, false) => Color::Yellow,
+        (4, false) => Color::Blue,
+        (5, false) => Color::Magenta,
+        (6, false) => Color::Cyan,
+        (7, false) => Color::Gray,
+        (0, true) => Color::DarkGray,
+        (1, true) => Color::LightRed,
+        (2, true) => Color::LightGreen,
+        (3, true) => Color::LightYellow,
+        (4, true) => Color::LightBlue,
+        (5, true) => Color::LightMagenta,
+        (6, true) => Color::LightCyan,
+        (7, true) => Color::White,
+        _ => Color::Reset,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1324,5 +1452,14 @@ mod tests {
         assert_eq!(parsed.jar_path.as_deref(), Some(Path::new("velocity.jar")));
         assert_eq!(parsed.java_args, vec!["-Dfoo=bar"]);
         assert_eq!(parsed.server_args, vec!["nogui"]);
+    }
+
+    #[test]
+    fn parses_ansi_color_spans() {
+        let line = ansi_to_line("\u{1b}[31mred\u{1b}[0m plain");
+        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans[0].content.as_ref(), "red");
+        assert_eq!(line.spans[0].style.fg, Some(Color::Red));
+        assert_eq!(line.spans[1].content.as_ref(), " plain");
     }
 }

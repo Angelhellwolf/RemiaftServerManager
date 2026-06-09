@@ -60,7 +60,8 @@ Inside the TUI:
 ```text
 u edit the startup command, for example: java -Xms1G -Xmx4G -jar server.jar nogui
 o open/close live console for the selected server
-i send console command
+type in the console and press Enter to send a command
+Ctrl-U detach from the console view without stopping the server
 b show/hide the right side panel
 Up/Down scroll console output when console is open
 PageUp/PageDown scroll console output faster
@@ -87,15 +88,18 @@ args, then keeps managing it without requiring `screen`.
 ## Runtime Model
 
 The CLI is not the long-running runtime. Starting a server launches a per-server
-background `remiaft supervise <id>` process. On Unix this supervisor creates a new
-session before it starts Minecraft, so closing the TUI or pressing Ctrl-C only
-exits the management interface. The Minecraft process keeps running.
+background `remiaft supervise <id>` process. On Unix this supervisor starts the
+server inside a PTY, so Minecraft/Velocity sees a real terminal, ANSI colors are
+preserved in the console log, and commands typed in the TUI are written back to
+the server terminal. Closing the TUI, pressing Ctrl-C in the manager, or pressing
+Ctrl-U to detach from the console view only exits the management interface. The
+Minecraft process keeps running.
 
-The supervisor owns the Minecraft child process, writes logs, forwards queued
-console commands, and restarts the server when `auto_restart` is enabled. The
-next time `remiaft` opens, it reloads the saved config and reads runtime PID
-files to show the existing server state. This removes the need to switch into
-`screen` sessions.
+The supervisor owns the Minecraft child process, writes raw terminal logs,
+forwards queued console commands, and restarts the server when `auto_restart` is
+enabled. The next time `remiaft` opens, it reloads the saved config and reads
+runtime PID files to show the existing server state. This removes the need to
+switch into `screen` sessions.
 
 ## Config
 
