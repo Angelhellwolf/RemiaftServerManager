@@ -58,6 +58,12 @@ TUI to change language later.
 Inside the TUI:
 
 ```text
+o open/close live console for the selected server
+i send console command
+b show/hide the right side panel
+Up/Down scroll console output when console is open
+PageUp/PageDown scroll console output faster
+End follow new console output again
 n add server
 s start selected server
 x stop selected server

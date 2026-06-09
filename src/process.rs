@@ -97,6 +97,10 @@ pub fn append_command(store: &ConfigStore, server: &ServerConfig, command: &str)
     Ok(())
 }
 
+pub fn minecraft_log_path_for(store: &ConfigStore, server: &ServerConfig) -> PathBuf {
+    minecraft_log_path(store, server)
+}
+
 pub fn run_supervisor(store: &ConfigStore, server_id: &str) -> Result<()> {
     let config = store.load()?;
     let server = config.find_server(server_id)?.clone();

@@ -44,6 +44,12 @@ pub enum Text {
     SelectedServer,
     NoServerSelected,
     ManagerExitHint,
+    Console,
+    ConsoleHint,
+    ConsoleFollow,
+    ConsolePaused,
+    ConsoleEmpty,
+    DetailPanelHidden,
     NoServers,
     AddServerHint,
     CustomJarHint,
@@ -105,9 +111,7 @@ pub fn text(language: Language, key: Text) -> &'static str {
 
 fn english(key: Text) -> &'static str {
     match key {
-        Text::Help => {
-            "n new | s start | x stop | c command | a auto-restart | e java args | g server args | p path | j jar | v versions | l language | d delete | q quit"
-        }
+        Text::Help => "o console | i command | b panel | s start | x stop | n new | q quit",
         Text::LanguageSaved => "language saved",
         Text::LanguagePromptTitle => "Language",
         Text::LanguagePromptBody => "Choose the interface language before using remiaft.",
@@ -121,6 +125,14 @@ fn english(key: Text) -> &'static str {
         Text::SelectedServer => "Selected server",
         Text::NoServerSelected => "No server selected",
         Text::ManagerExitHint => "Ctrl-C/q exits the UI only. Running servers stay online.",
+        Text::Console => "Console",
+        Text::ConsoleHint => {
+            "o console | i command | Up/Down scroll | PgUp/PgDn page | End follow | b details"
+        }
+        Text::ConsoleFollow => "following live output",
+        Text::ConsolePaused => "manual scroll; new output will not move the view",
+        Text::ConsoleEmpty => "No console output yet.",
+        Text::DetailPanelHidden => "details hidden",
         Text::NoServers => "No servers. Press n to add one.",
         Text::AddServerHint => "Add a server with n.",
         Text::CustomJarHint => "Use a vanilla server.jar, Paper, Fabric, Forge, or any custom jar.",
@@ -176,9 +188,7 @@ fn english(key: Text) -> &'static str {
 
 fn chinese_simplified(key: Text) -> &'static str {
     match key {
-        Text::Help => {
-            "n 新建 | s 启动 | x 停止 | c 命令 | a 自动重启 | e Java参数 | g 服务端参数 | p 目录 | j Jar | v 版本 | l 语言 | d 删除 | q 退出"
-        }
+        Text::Help => "o 控制台 | i 命令 | b 面板 | s 启动 | x 停止 | n 新建 | q 退出",
         Text::LanguageSaved => "语言已保存",
         Text::LanguagePromptTitle => "语言 / Language",
         Text::LanguagePromptBody => "请选择 remiaft 管理界面语言。",
@@ -192,6 +202,14 @@ fn chinese_simplified(key: Text) -> &'static str {
         Text::SelectedServer => "当前服务器",
         Text::NoServerSelected => "未选择服务器",
         Text::ManagerExitHint => "Ctrl-C/q 只退出界面，运行中的服务器会继续在线。",
+        Text::Console => "控制台",
+        Text::ConsoleHint => {
+            "o 控制台 | i 输入命令 | ↑/↓ 滚动 | PgUp/PgDn 翻页 | End 跟随 | b 详情"
+        }
+        Text::ConsoleFollow => "正在跟随实时输出",
+        Text::ConsolePaused => "手动滚动中，新输出不会移动视图",
+        Text::ConsoleEmpty => "暂无控制台输出。",
+        Text::DetailPanelHidden => "详情面板已隐藏",
         Text::NoServers => "还没有服务器。按 n 添加。",
         Text::AddServerHint => "按 n 添加服务器。",
         Text::CustomJarHint => "可使用原版 server.jar、Paper、Fabric、Forge 或任意自定义 jar。",

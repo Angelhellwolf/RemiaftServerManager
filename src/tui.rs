@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -24,6 +25,7 @@ pub async fn run(store: ConfigStore) -> Result<()> {
     let mut app = App::new(store)?;
 
     loop {
+        app.refresh_console();
         terminal.draw(|frame| draw(frame, &app))?;
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
@@ -82,6 +84,12 @@ enum Mode {
     Command,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum MainView {
+    Details,
+    Console,
+}
+
 struct Draft {
     name: String,
     dir: String,
@@ -98,6 +106,12 @@ struct App {
     draft: Draft,
     status: String,
     versions: Vec<String>,
+    main_view: MainView,
+    show_details: bool,
+    console_server_id: Option<String>,
+    console_lines: Vec<String>,
+    console_end: Option<usize>,
+    console_follow: bool,
 }
 
 impl App {
@@ -124,6 +138,12 @@ impl App {
             },
             status: i18n::text(language, Text::Help).to_string(),
             versions: Vec::new(),
+            main_view: MainView::Details,
+            show_details: true,
+            console_server_id: None,
+            console_lines: Vec::new(),
+            console_end: None,
+            console_follow: true,
         })
     }
 
@@ -156,6 +176,8 @@ impl App {
     async fn handle_normal_key(&mut self, key: KeyEvent) -> Result<bool> {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+            KeyCode::Down if self.main_view == MainView::Console => self.scroll_console(1),
+            KeyCode::Up if self.main_view == MainView::Console => self.scroll_console(-1),
             KeyCode::Down => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Char('n') => {
@@ -176,6 +198,12 @@ impl App {
             KeyCode::Char('e') => self.begin_edit_java_args(),
             KeyCode::Char('g') => self.begin_edit_server_args(),
             KeyCode::Char('c') => self.begin_command(),
+            KeyCode::Char('i') => self.begin_command(),
+            KeyCode::Char('o') => self.toggle_console(),
+            KeyCode::Char('b') => self.toggle_details(),
+            KeyCode::End => self.follow_console(),
+            KeyCode::PageUp => self.scroll_console_page(-1),
+            KeyCode::PageDown => self.scroll_console_page(1),
             KeyCode::Char('v') => self.fetch_versions().await,
             KeyCode::Char('l') => {
                 self.mode = Mode::LanguageSelect;
@@ -300,6 +328,9 @@ impl App {
         }
         let next = self.selected as isize + delta;
         self.selected = next.clamp(0, len.saturating_sub(1) as isize) as usize;
+        if self.main_view == MainView::Console {
+            self.reset_console_for_selection();
+        }
     }
 
     fn selected(&self) -> Option<&crate::config::ServerConfig> {
@@ -395,6 +426,127 @@ impl App {
         }
     }
 
+    fn toggle_console(&mut self) {
+        match self.main_view {
+            MainView::Details => {
+                if self.selected().is_some() {
+                    self.main_view = MainView::Console;
+                    self.reset_console_for_selection();
+                    self.status = self.t(Text::ConsoleFollow).to_string();
+                }
+            }
+            MainView::Console => {
+                self.main_view = MainView::Details;
+                self.status = self.t(Text::Help).to_string();
+            }
+        }
+    }
+
+    fn toggle_details(&mut self) {
+        self.show_details = !self.show_details;
+        if self.show_details {
+            self.status = self.t(Text::Help).to_string();
+        } else {
+            self.status = self.t(Text::DetailPanelHidden).to_string();
+        }
+    }
+
+    fn follow_console(&mut self) {
+        if self.main_view == MainView::Console {
+            self.console_follow = true;
+            self.console_end = None;
+            self.status = self.t(Text::ConsoleFollow).to_string();
+        }
+    }
+
+    fn scroll_console_page(&mut self, direction: isize) {
+        if self.main_view != MainView::Console {
+            return;
+        }
+        let delta = if direction < 0 { -10 } else { 10 };
+        self.scroll_console(delta);
+    }
+
+    fn scroll_console(&mut self, delta: isize) {
+        if self.main_view != MainView::Console {
+            return;
+        }
+        if delta < 0 {
+            let end = self.console_end.unwrap_or(self.console_lines.len());
+            self.console_end = Some(end.saturating_sub(delta.unsigned_abs()).max(1));
+            self.console_follow = false;
+            self.status = self.t(Text::ConsolePaused).to_string();
+        } else {
+            let end = self.console_end.unwrap_or(self.console_lines.len());
+            let next = end
+                .saturating_add(delta as usize)
+                .min(self.console_lines.len());
+            if next >= self.console_lines.len() {
+                self.console_follow = true;
+                self.console_end = None;
+                self.status = self.t(Text::ConsoleFollow).to_string();
+            } else {
+                self.console_end = Some(next.max(1));
+            }
+        }
+    }
+
+    fn reset_console_for_selection(&mut self) {
+        self.console_server_id = self.selected().map(|server| server.id.clone());
+        self.console_lines.clear();
+        self.console_end = None;
+        self.console_follow = true;
+    }
+
+    fn refresh_console(&mut self) {
+        if self.main_view != MainView::Console {
+            return;
+        }
+        let Some(server) = self.selected().cloned() else {
+            self.console_lines.clear();
+            return;
+        };
+        if self.console_server_id.as_deref() != Some(server.id.as_str()) {
+            self.reset_console_for_selection();
+        }
+        let path = process::minecraft_log_path_for(&self.store, &server);
+        let content = fs::read_to_string(path).unwrap_or_default();
+        self.console_lines = content.lines().map(ToString::to_string).collect();
+        if self.console_lines.len() > 5_000 {
+            let keep_from = self.console_lines.len() - 5_000;
+            self.console_lines.drain(..keep_from);
+            if let Some(end) = self.console_end {
+                self.console_end = Some(end.saturating_sub(keep_from).max(1));
+            }
+        }
+        if self.console_follow {
+            self.console_end = None;
+        } else {
+            let len = self.console_lines.len();
+            self.console_end = self.console_end.map(|end| end.min(len).max(1));
+        }
+    }
+
+    fn console_visible_lines(&self, height: usize) -> Vec<Line<'static>> {
+        if self.console_lines.is_empty() {
+            return vec![Line::from(self.t(Text::ConsoleEmpty).to_string())];
+        }
+
+        let end = if self.console_follow {
+            self.console_lines.len()
+        } else {
+            self.console_end
+                .unwrap_or(self.console_lines.len())
+                .min(self.console_lines.len())
+                .max(1)
+        };
+        let start = end.saturating_sub(height);
+        self.console_lines[start..end]
+            .iter()
+            .map(|line| Line::from(line.clone()))
+            .collect()
+    }
+
     async fn fetch_versions(&mut self) {
         self.status = self.t(Text::FetchingVersions).to_string();
         match manifest::fetch_versions(12).await {
@@ -474,24 +626,29 @@ fn draw(frame: &mut Frame, app: &App) {
     .block(Block::default().borders(Borders::ALL));
     frame.render_widget(header, chunks[0]);
 
-    let body = if chunks[1].width >= 120 {
+    let wide = chunks[1].width >= 120;
+    let show_side_panel = wide && app.show_details;
+    let body = if show_side_panel {
         Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(34),
-                Constraint::Percentage(46),
+                Constraint::Percentage(32),
+                Constraint::Percentage(48),
                 Constraint::Percentage(20),
             ])
             .split(chunks[1])
     } else {
         Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
             .split(chunks[1])
     };
     draw_server_list(frame, app, body[0]);
-    draw_detail(frame, app, body[1]);
-    if body.len() > 2 {
+    match app.main_view {
+        MainView::Details => draw_detail(frame, app, body[1]),
+        MainView::Console => draw_console(frame, app, body[1]),
+    }
+    if show_side_panel && body.len() > 2 {
         draw_quick_panel(frame, app, body[2]);
     }
 
@@ -655,6 +812,25 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
+fn draw_console(frame: &mut Frame, app: &App, area: Rect) {
+    let title = if let Some(server) = app.selected() {
+        let mode = if app.console_follow {
+            app.t(Text::ConsoleFollow)
+        } else {
+            app.t(Text::ConsolePaused)
+        };
+        format!("{} - {} ({mode})", app.t(Text::Console), server.name)
+    } else {
+        app.t(Text::Console).to_string()
+    };
+    let height = area.height.saturating_sub(2).max(1) as usize;
+    let lines = app.console_visible_lines(height);
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
 fn draw_quick_panel(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -699,6 +875,8 @@ fn draw_quick_panel(frame: &mut Frame, app: &App, area: Rect) {
     )));
     lines.extend(shortcut_lines(app));
     lines.push(Line::from(""));
+    lines.push(Line::from(app.t(Text::ConsoleHint)));
+    lines.push(Line::from(""));
     lines.push(Line::from(app.t(Text::ManagerExitHint)));
 
     let paragraph = Paragraph::new(lines)
@@ -715,6 +893,10 @@ fn shortcut_lines(app: &App) -> Vec<Line<'static>> {
     match app.language {
         Language::English => vec![
             Line::from("n  new server"),
+            Line::from("o  console/details"),
+            Line::from("i  send command"),
+            Line::from("b  side panel"),
+            Line::from("End  follow output"),
             Line::from("s  start"),
             Line::from("x  stop"),
             Line::from("r  restart"),
@@ -731,6 +913,10 @@ fn shortcut_lines(app: &App) -> Vec<Line<'static>> {
         ],
         Language::ChineseSimplified => vec![
             Line::from("n  新建服务器"),
+            Line::from("o  控制台/详情"),
+            Line::from("i  发送命令"),
+            Line::from("b  侧栏面板"),
+            Line::from("End  跟随输出"),
             Line::from("s  启动"),
             Line::from("x  停止"),
             Line::from("r  重启"),
