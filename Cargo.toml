@@ -1,6 +1,6 @@
 [package]
 name = "remiaft"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 license = "MIT"
 description = "Modern self-hosted Minecraft server manager for Remiaft"

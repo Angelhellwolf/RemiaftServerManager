@@ -117,9 +117,7 @@ pub fn text(language: Language, key: Text) -> &'static str {
 
 fn english(key: Text) -> &'static str {
     match key {
-        Text::Help => {
-            "Enter select | Ctrl-S/X/R group/all selected | Ctrl-G group | m move | o console"
-        }
+        Text::Help => "Enter select | F5/F6/F7 batch | F2 group | F3 move | o console",
         Text::LanguageSaved => "language saved",
         Text::LanguagePromptTitle => "Language",
         Text::LanguagePromptBody => "Choose the interface language before using remiaft.",
@@ -204,7 +202,7 @@ fn english(key: Text) -> &'static str {
 
 fn chinese_simplified(key: Text) -> &'static str {
     match key {
-        Text::Help => "Enter 多选 | Ctrl-S/X/R 批量 | Ctrl-G 分组 | m 移动 | o 控制台",
+        Text::Help => "Enter 多选 | F5/F6/F7 批量 | F2 分组 | F3 移动 | o 控制台",
         Text::LanguageSaved => "语言已保存",
         Text::LanguagePromptTitle => "语言 / Language",
         Text::LanguagePromptBody => "请选择 remiaft 管理界面语言。",

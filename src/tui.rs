@@ -219,18 +219,11 @@ impl App {
     async fn handle_normal_key(&mut self, key: KeyEvent) -> Result<bool> {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
-            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.start_targets()?
-            }
-            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.stop_targets()?
-            }
-            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.restart_targets()?
-            }
-            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.begin_add_group()
-            }
+            KeyCode::F(2) => self.begin_add_group(),
+            KeyCode::F(3) => self.begin_move_to_group(),
+            KeyCode::F(5) => self.start_targets()?,
+            KeyCode::F(6) => self.stop_targets()?,
+            KeyCode::F(7) => self.restart_targets()?,
             KeyCode::Down if self.main_view == MainView::Console => self.scroll_console(1),
             KeyCode::Up if self.main_view == MainView::Console => self.scroll_console(-1),
             KeyCode::Down => self.move_selection(1),
@@ -248,9 +241,7 @@ impl App {
             KeyCode::Char('d') => self.delete_selected()?,
             KeyCode::Char('s') => self.start_selected()?,
             KeyCode::Char('x') => self.stop_selected()?,
-            KeyCode::Char('r') => {
-                self.restart_targets()?;
-            }
+            KeyCode::Char('r') => self.restart_selected()?,
             KeyCode::Char('a') => self.toggle_auto_restart()?,
             KeyCode::Char('m') => self.begin_move_to_group(),
             KeyCode::Char('p') => self.begin_edit_dir(),
@@ -637,11 +628,40 @@ impl App {
     }
 
     fn start_selected(&mut self) -> Result<()> {
-        self.start_targets()
+        let Some(server) = self.selected().cloned() else {
+            return Ok(());
+        };
+        process::start_supervisor(&self.store, &server)?;
+        self.status = match self.language {
+            Language::English => format!("started {}", server.name),
+            Language::ChineseSimplified => format!("已启动 {}", server.name),
+        };
+        Ok(())
     }
 
     fn stop_selected(&mut self) -> Result<()> {
-        self.stop_targets()
+        let Some(server) = self.selected().cloned() else {
+            return Ok(());
+        };
+        process::stop_server(&self.store, &server)?;
+        self.status = match self.language {
+            Language::English => format!("stopped {}", server.name),
+            Language::ChineseSimplified => format!("已停止 {}", server.name),
+        };
+        Ok(())
+    }
+
+    fn restart_selected(&mut self) -> Result<()> {
+        let Some(server) = self.selected().cloned() else {
+            return Ok(());
+        };
+        process::stop_server(&self.store, &server)?;
+        process::start_supervisor(&self.store, &server)?;
+        self.status = match self.language {
+            Language::English => format!("restarted {}", server.name),
+            Language::ChineseSimplified => format!("已重启 {}", server.name),
+        };
+        Ok(())
     }
 
     fn restart_targets(&mut self) -> Result<()> {
@@ -1549,8 +1569,8 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
                 Language::ChineseSimplified => "Enter 会递归选择该分组下的全部服务器。",
             }),
             Line::from(match app.language {
-                Language::English => "Ctrl-S/Ctrl-X/Ctrl-R start, stop, or restart the group.",
-                Language::ChineseSimplified => "Ctrl-S/Ctrl-X/Ctrl-R 可启动、停止或重启该分组。",
+                Language::English => "F5/F6/F7 start, stop, or restart the group.",
+                Language::ChineseSimplified => "F5/F6/F7 可启动、停止或重启该分组。",
             }),
         ]
     } else {
@@ -1695,18 +1715,20 @@ fn shortcut_lines(app: &App) -> Vec<Line<'static>> {
     match app.language {
         Language::English => vec![
             Line::from("n  new server"),
-            Line::from("Ctrl-G  new group"),
+            Line::from("F2  new group"),
             Line::from("Enter  select item"),
             Line::from("Left/Right  fold group"),
-            Line::from("m  move selected to group"),
-            Line::from("Ctrl-S/X/R  selected/group"),
+            Line::from("F3/m  move to group"),
+            Line::from("F5  start selected/group"),
+            Line::from("F6  stop selected/group"),
+            Line::from("F7  restart selected/group"),
             Line::from("o  console/details"),
             Line::from("i  send command"),
             Line::from("b  side panel"),
             Line::from("End  follow output"),
-            Line::from("s  start"),
-            Line::from("x  stop"),
-            Line::from("r  restart"),
+            Line::from("s  start current"),
+            Line::from("x  stop current"),
+            Line::from("r  restart current"),
             Line::from("c  console command"),
             Line::from("a  auto-restart"),
             Line::from("e  Java args"),
@@ -1722,18 +1744,20 @@ fn shortcut_lines(app: &App) -> Vec<Line<'static>> {
         ],
         Language::ChineseSimplified => vec![
             Line::from("n  新建服务器"),
-            Line::from("Ctrl-G  新建分组"),
+            Line::from("F2  新建分组"),
             Line::from("Enter  选择项目"),
             Line::from("←/→  折叠/展开分组"),
-            Line::from("m  移动到分组"),
-            Line::from("Ctrl-S/X/R  批量操作"),
+            Line::from("F3/m  移动到分组"),
+            Line::from("F5  启动所选/分组"),
+            Line::from("F6  停止所选/分组"),
+            Line::from("F7  重启所选/分组"),
             Line::from("o  控制台/详情"),
             Line::from("i  发送命令"),
             Line::from("b  侧栏面板"),
             Line::from("End  跟随输出"),
-            Line::from("s  启动"),
-            Line::from("x  停止"),
-            Line::from("r  重启"),
+            Line::from("s  启动当前"),
+            Line::from("x  停止当前"),
+            Line::from("r  重启当前"),
             Line::from("c  控制台命令"),
             Line::from("a  自动重启"),
             Line::from("e  Java 参数"),
