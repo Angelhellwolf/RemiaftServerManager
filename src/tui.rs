@@ -782,21 +782,24 @@ impl App {
 
 fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    frame.render_widget(Clear, area);
     if matches!(app.mode, Mode::LanguageSelect) {
         draw_language_select(frame, app, area);
         return;
     }
 
+    let header_height = if area.height >= 8 { 3 } else { 1 };
+    let footer_height = if area.height >= 10 { 3 } else { 1 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Min(10),
-            Constraint::Length(3),
+            Constraint::Length(header_height),
+            Constraint::Min(1),
+            Constraint::Length(footer_height),
         ])
         .split(area);
 
-    let header = Paragraph::new(Line::from(vec![
+    let header_text = Line::from(vec![
         Span::styled(
             "remiaft",
             Style::default()
@@ -808,8 +811,12 @@ fn draw(frame: &mut Frame, app: &App) {
             app.t(Text::Config),
             app.store.config_path().to_string_lossy()
         )),
-    ]))
-    .block(Block::default().borders(Borders::ALL));
+    ]);
+    let header = if chunks[0].height >= 3 {
+        Paragraph::new(header_text).block(Block::default().borders(Borders::ALL))
+    } else {
+        Paragraph::new(header_text)
+    };
     frame.render_widget(header, chunks[0]);
 
     if app.main_view == MainView::Console {
@@ -818,49 +825,78 @@ fn draw(frame: &mut Frame, app: &App) {
         draw_manager_workspace(frame, app, chunks[1]);
     }
 
-    let footer = Paragraph::new(app.status.as_str())
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(app.t(Text::Status)),
-        )
-        .wrap(Wrap { trim: true });
+    let footer = if chunks[2].height >= 3 {
+        Paragraph::new(app.status.as_str())
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(app.t(Text::Status)),
+            )
+            .wrap(Wrap { trim: true })
+    } else {
+        Paragraph::new(app.status.as_str()).wrap(Wrap { trim: true })
+    };
     frame.render_widget(footer, chunks[2]);
 
     if !matches!(app.mode, Mode::Normal | Mode::LanguageSelect) {
-        draw_input(frame, app, centered_rect(70, 20, area));
+        draw_input(frame, app, centered_input_rect(area));
     }
 }
 
 fn draw_manager_workspace(frame: &mut Frame, app: &App, area: Rect) {
-    let wide = area.width >= 120;
-    let show_side_panel = wide && app.show_details;
-    let body = if show_side_panel {
-        Layout::default()
+    if area.width >= 120 && app.show_details {
+        let body = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Percentage(32),
                 Constraint::Percentage(48),
                 Constraint::Percentage(20),
             ])
-            .split(area)
-    } else {
-        Layout::default()
+            .split(area);
+        draw_server_list(frame, app, body[0]);
+        draw_detail(frame, app, body[1]);
+        draw_quick_panel(frame, app, body[2]);
+    } else if area.width >= 72 {
+        let body = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-            .split(area)
-    };
-    draw_server_list(frame, app, body[0]);
-    draw_detail(frame, app, body[1]);
-    if show_side_panel && body.len() > 2 {
-        draw_quick_panel(frame, app, body[2]);
+            .split(area);
+        draw_server_list(frame, app, body[0]);
+        draw_detail(frame, app, body[1]);
+    } else {
+        let list_height = if area.height >= 16 {
+            (area.height / 3).clamp(4, 10)
+        } else {
+            (area.height / 2).max(3)
+        };
+        let body = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(list_height), Constraint::Min(1)])
+            .split(area);
+        draw_server_list(frame, app, body[0]);
+        draw_detail(frame, app, body[1]);
     }
 }
 
 fn draw_console_workspace(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height < 6 {
+        draw_console(frame, app, area);
+        return;
+    }
+    let header_height = if area.height >= 12 {
+        5
+    } else if area.height >= 8 {
+        3
+    } else {
+        0
+    };
+    if header_height == 0 {
+        draw_console(frame, app, area);
+        return;
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(5), Constraint::Min(6)])
+        .constraints([Constraint::Length(header_height), Constraint::Min(1)])
         .split(area);
     draw_console_server_header(frame, app, chunks[0]);
     draw_console(frame, app, chunks[1]);
@@ -869,28 +905,28 @@ fn draw_console_workspace(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_console_server_header(frame: &mut Frame, app: &App, area: Rect) {
     let lines = if let Some(server) = app.selected() {
         let status = process::runtime_status(&app.store, server);
-        vec![
-            Line::from(vec![
-                Span::styled(
-                    format!("{}: {}", app.t(Text::Name), server.name),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!(
-                    "  {}: {}  {}: {}",
-                    app.t(Text::Status),
-                    status_label(app, status),
-                    app.t(Text::Id),
-                    server.id
-                )),
-            ]),
-            Line::from(format!(
+        let mut lines = vec![Line::from(vec![
+            Span::styled(
+                format!("{}: {}", app.t(Text::Name), server.name),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "  {}: {}  {}: {}",
+                app.t(Text::Status),
+                status_label(app, status),
+                app.t(Text::Id),
+                server.id
+            )),
+        ])];
+        if area.height >= 5 {
+            lines.push(Line::from(format!(
                 "{}: {}",
                 app.t(Text::Directory),
                 server.directory.display()
-            )),
-            Line::from(format!(
+            )));
+            lines.push(Line::from(format!(
                 "{}: {}  |  Ctrl-U {}  |  Enter {}",
                 app.t(Text::Jar),
                 server.jar_path.display(),
@@ -902,8 +938,9 @@ fn draw_console_server_header(frame: &mut Frame, app: &App, area: Rect) {
                     Language::English => "send",
                     Language::ChineseSimplified => "发送",
                 }
-            )),
-        ]
+            )));
+        }
+        lines
     } else {
         vec![Line::from(app.t(Text::NoServerSelected))]
     };
@@ -1078,10 +1115,29 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_console(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let input_height = if area.height >= 6 {
+        3
+    } else if area.height >= 3 {
+        1
+    } else {
+        0
+    };
+    if input_height == 0 {
+        draw_console_log(frame, app, area);
+        return;
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .constraints([Constraint::Min(1), Constraint::Length(input_height)])
         .split(area);
+    draw_console_log(frame, app, chunks[0]);
+    draw_console_input(frame, app, chunks[1]);
+}
+
+fn draw_console_log(frame: &mut Frame, app: &App, area: Rect) {
     let title = if let Some(server) = app.selected() {
         let mode = if app.console_follow {
             app.t(Text::ConsoleFollow)
@@ -1092,28 +1148,65 @@ fn draw_console(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         app.t(Text::Console).to_string()
     };
-    let height = chunks[0].height.saturating_sub(2).max(1) as usize;
-    let width = chunks[0].width.saturating_sub(2).max(1) as usize;
+    let bordered = area.height >= 3 && area.width >= 4;
+    let height = if bordered {
+        area.height.saturating_sub(2).max(1) as usize
+    } else {
+        area.height.max(1) as usize
+    };
+    let width = if bordered {
+        area.width.saturating_sub(2).max(1) as usize
+    } else {
+        area.width.max(1) as usize
+    };
     let lines = app.console_visible_lines(height, width);
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, chunks[0]);
+    let paragraph = if bordered {
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .wrap(Wrap { trim: false })
+    } else {
+        Paragraph::new(lines).wrap(Wrap { trim: false })
+    };
+    frame.render_widget(paragraph, area);
+}
 
-    let input_width = chunks[1].width.saturating_sub(2).max(1) as usize;
+fn draw_console_input(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let bordered = area.height >= 3 && area.width >= 4;
+    let input_width = if bordered {
+        area.width.saturating_sub(2).max(1) as usize
+    } else {
+        area.width.max(1) as usize
+    };
     let (visible_input, cursor_col) =
         input_view(&app.console_input, app.console_cursor, input_width);
-    let input = Paragraph::new(visible_input)
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            "{} - {}",
-            app.t(Text::ConsoleInput),
-            app.t(Text::ConsoleExitHint)
-        )))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(input, chunks[1]);
+    let input = if bordered {
+        Paragraph::new(visible_input)
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                "{} - {}",
+                app.t(Text::ConsoleInput),
+                app.t(Text::ConsoleExitHint)
+            )))
+            .wrap(Wrap { trim: false })
+    } else {
+        Paragraph::new(visible_input).wrap(Wrap { trim: false })
+    };
+    frame.render_widget(input, area);
+    let cursor_x = if bordered {
+        area.x.saturating_add(1).saturating_add(cursor_col)
+    } else {
+        area.x.saturating_add(cursor_col)
+    };
+    let cursor_y = if bordered {
+        area.y.saturating_add(1)
+    } else {
+        area.y
+    };
     frame.set_cursor_position(Position::new(
-        chunks[1].x.saturating_add(1).saturating_add(cursor_col),
-        chunks[1].y.saturating_add(1),
+        cursor_x.min(area.right().saturating_sub(1)),
+        cursor_y.min(area.bottom().saturating_sub(1)),
     ));
 }
 
@@ -1225,6 +1318,9 @@ fn shortcut_lines(app: &App) -> Vec<Line<'static>> {
 }
 
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
     frame.render_widget(Clear, area);
     let title = match app.mode {
         Mode::AddName => app.t(Text::InputNewName),
@@ -1239,15 +1335,34 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Command => app.t(Text::InputSendCommand),
         Mode::LanguageSelect | Mode::Normal => "",
     };
-    let input_width = area.width.saturating_sub(2).max(1) as usize;
+    let bordered = area.height >= 3 && area.width >= 4;
+    let input_width = if bordered {
+        area.width.saturating_sub(2).max(1) as usize
+    } else {
+        area.width.max(1) as usize
+    };
     let (visible_input, cursor_col) = input_view(&app.input, app.input_cursor, input_width);
-    let input = Paragraph::new(visible_input)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .wrap(Wrap { trim: false });
+    let input = if bordered {
+        Paragraph::new(visible_input)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .wrap(Wrap { trim: false })
+    } else {
+        Paragraph::new(visible_input).wrap(Wrap { trim: false })
+    };
     frame.render_widget(input, area);
+    let cursor_x = if bordered {
+        area.x.saturating_add(1).saturating_add(cursor_col)
+    } else {
+        area.x.saturating_add(cursor_col)
+    };
+    let cursor_y = if bordered {
+        area.y.saturating_add(1)
+    } else {
+        area.y
+    };
     frame.set_cursor_position(Position::new(
-        area.x.saturating_add(1).saturating_add(cursor_col),
-        area.y.saturating_add(1),
+        cursor_x.min(area.right().saturating_sub(1)),
+        cursor_y.min(area.bottom().saturating_sub(1)),
     ));
 }
 
@@ -1277,6 +1392,28 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+fn centered_input_rect(r: Rect) -> Rect {
+    let width = if r.width >= 100 {
+        r.width.saturating_mul(70) / 100
+    } else {
+        r.width.saturating_sub(2)
+    }
+    .clamp(1, r.width);
+    let height = if r.height >= 12 { 5 } else { 3 }.min(r.height.max(1));
+    centered_fixed_rect(width, height, r)
+}
+
+fn centered_fixed_rect(width: u16, height: u16, r: Rect) -> Rect {
+    let width = width.min(r.width).max(1);
+    let height = height.min(r.height).max(1);
+    Rect {
+        x: r.x + r.width.saturating_sub(width) / 2,
+        y: r.y + r.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
 }
 
 fn fallback<'a>(value: &'a str, default: &'a str) -> &'a str {
