@@ -1,4 +1,6 @@
 /target/
+/remiaft
+/remiaft-linux-*
 /.idea/
 /.vscode/
 *.log

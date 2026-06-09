@@ -1031,7 +1031,7 @@ dependencies = [
 
 [[package]]
 name = "remiaft"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "clap",
@@ -1045,6 +1045,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "unicode-width 0.2.0",
  "uuid",
 ]
 
