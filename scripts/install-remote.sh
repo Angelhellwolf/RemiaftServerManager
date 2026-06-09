@@ -4,6 +4,7 @@ set -eu
 REPO="${REMIAFT_REPO:-Angelhellwolf/RemiaftServerManager}"
 PREFIX="${PREFIX:-$HOME/.local}"
 BIN_DIR="$PREFIX/bin"
+BIN_PATH="$BIN_DIR/remiaft"
 TMP_DIR="${TMPDIR:-/tmp}/remiaft-install-$$"
 
 need() {
@@ -45,6 +46,11 @@ mkdir -p "$TMP_DIR" "$BIN_DIR"
 asset="$(asset_name)"
 url="https://github.com/$REPO/releases/latest/download/$asset"
 
+old_version=""
+if [ -x "$BIN_PATH" ]; then
+    old_version="$("$BIN_PATH" --version 2>/dev/null || true)"
+fi
+
 echo "Installing remiaft from $url"
 if ! curl --retry 5 --retry-delay 2 --retry-all-errors -fL "$url" -o "$TMP_DIR/remiaft"; then
     echo "failed to download release asset" >&2
@@ -54,9 +60,20 @@ if ! curl --retry 5 --retry-delay 2 --retry-all-errors -fL "$url" -o "$TMP_DIR/r
 fi
 
 chmod +x "$TMP_DIR/remiaft"
-mv "$TMP_DIR/remiaft" "$BIN_DIR/remiaft"
+new_version="$("$TMP_DIR/remiaft" --version 2>/dev/null || true)"
+mv -f "$TMP_DIR/remiaft" "$BIN_PATH"
 
-echo "Installed remiaft to $BIN_DIR/remiaft"
+if [ -n "$old_version" ] && [ -n "$new_version" ]; then
+    if [ "$old_version" = "$new_version" ]; then
+        echo "remiaft is already up to date: $new_version"
+    else
+        echo "Updated remiaft: $old_version -> $new_version"
+    fi
+else
+    echo "Installed remiaft${new_version:+: $new_version}"
+fi
+
+echo "Binary path: $BIN_PATH"
 case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
     *) echo "Add $BIN_DIR to PATH if the remiaft command is not found." ;;
