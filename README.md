@@ -51,6 +51,10 @@ remiaft restart survival
 remiaft versions --limit 20
 ```
 
+On first launch, `remiaft` asks for the interface language and saves it in the
+user config. English and Simplified Chinese are supported now; press `l` in the
+TUI to change language later.
+
 Inside the TUI:
 
 ```text

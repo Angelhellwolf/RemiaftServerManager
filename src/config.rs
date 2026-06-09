@@ -65,6 +65,8 @@ impl ConfigStore {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemiaftConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
     pub java_path: String,
     pub servers: Vec<ServerConfig>,
 }
@@ -72,6 +74,7 @@ pub struct RemiaftConfig {
 impl Default for RemiaftConfig {
     fn default() -> Self {
         Self {
+            language: None,
             java_path: "java".to_string(),
             servers: Vec::new(),
         }

@@ -16,6 +16,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::{Frame, Terminal};
 
 use crate::config::{ConfigStore, RemiaftConfig};
+use crate::i18n::{self, Language, Text};
 use crate::{manifest, process};
 
 pub async fn run(store: ConfigStore) -> Result<()> {
@@ -69,6 +70,7 @@ impl Drop for TerminalGuard {
 
 #[derive(Debug, Clone)]
 enum Mode {
+    LanguageSelect,
     Normal,
     AddName,
     AddDir,
@@ -91,6 +93,7 @@ struct App {
     config: RemiaftConfig,
     selected: usize,
     mode: Mode,
+    language: Language,
     input: String,
     draft: Draft,
     status: String,
@@ -100,18 +103,26 @@ struct App {
 impl App {
     fn new(store: ConfigStore) -> Result<Self> {
         let config = store.load()?;
+        let saved_language = config.language.as_deref().and_then(Language::from_code);
+        let language = saved_language.unwrap_or(Language::English);
+        let mode = if saved_language.is_some() {
+            Mode::Normal
+        } else {
+            Mode::LanguageSelect
+        };
         Ok(Self {
             store,
             config,
             selected: 0,
-            mode: Mode::Normal,
+            mode,
+            language,
             input: String::new(),
             draft: Draft {
                 name: String::new(),
                 dir: String::new(),
                 jar: "server.jar".to_string(),
             },
-            status: "n new | s start | x stop | c command | a auto-restart | e args | p path | j jar | v versions | d delete | q quit".to_string(),
+            status: i18n::text(language, Text::Help).to_string(),
             versions: Vec::new(),
         })
     }
@@ -122,9 +133,24 @@ impl App {
         }
 
         match self.mode {
+            Mode::LanguageSelect => self.handle_language_key(key),
             Mode::Normal => self.handle_normal_key(key).await,
             _ => self.handle_input_key(key),
         }
+    }
+
+    fn handle_language_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+            KeyCode::Char('1') | KeyCode::Char('e') | KeyCode::Char('E') => {
+                self.set_language(Language::English)?;
+            }
+            KeyCode::Char('2') | KeyCode::Char('z') | KeyCode::Char('Z') => {
+                self.set_language(Language::ChineseSimplified)?;
+            }
+            _ => {}
+        }
+        Ok(false)
     }
 
     async fn handle_normal_key(&mut self, key: KeyEvent) -> Result<bool> {
@@ -135,7 +161,7 @@ impl App {
             KeyCode::Char('n') => {
                 self.mode = Mode::AddName;
                 self.input.clear();
-                self.status = "server name:".to_string();
+                self.status = self.t(Text::ServerNamePrompt).to_string();
             }
             KeyCode::Char('d') => self.delete_selected()?,
             KeyCode::Char('s') => self.start_selected()?,
@@ -151,6 +177,10 @@ impl App {
             KeyCode::Char('g') => self.begin_edit_server_args(),
             KeyCode::Char('c') => self.begin_command(),
             KeyCode::Char('v') => self.fetch_versions().await,
+            KeyCode::Char('l') => {
+                self.mode = Mode::LanguageSelect;
+                self.status = i18n::text(self.language, Text::LanguagePromptHint).to_string();
+            }
             _ => {}
         }
         Ok(false)
@@ -161,7 +191,7 @@ impl App {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 self.input.clear();
-                self.status = "cancelled".to_string();
+                self.status = self.t(Text::Cancelled).to_string();
             }
             KeyCode::Enter => self.commit_input()?,
             KeyCode::Backspace => {
@@ -179,13 +209,13 @@ impl App {
                 self.draft.name = self.input.trim().to_string();
                 self.input.clear();
                 self.mode = Mode::AddDir;
-                self.status = "server directory:".to_string();
+                self.status = self.t(Text::ServerDirPrompt).to_string();
             }
             Mode::AddDir => {
                 self.draft.dir = self.input.trim().to_string();
                 self.input = self.draft.jar.clone();
                 self.mode = Mode::AddJar;
-                self.status = "server jar path, relative to directory is ok:".to_string();
+                self.status = self.t(Text::ServerJarPrompt).to_string();
             }
             Mode::AddJar => {
                 self.draft.jar = fallback(self.input.trim(), "server.jar").to_string();
@@ -197,14 +227,14 @@ impl App {
                 self.selected = self.config.servers.len().saturating_sub(1);
                 self.input.clear();
                 self.mode = Mode::Normal;
-                self.status = "server added".to_string();
+                self.status = self.t(Text::ServerAdded).to_string();
             }
             Mode::EditDir => {
                 let directory = PathBuf::from(self.input.trim());
                 if let Some(server) = self.selected_mut() {
                     server.directory = directory;
                     self.save()?;
-                    self.status = "directory updated".to_string();
+                    self.status = self.t(Text::DirectoryUpdated).to_string();
                 }
                 self.input.clear();
                 self.mode = Mode::Normal;
@@ -214,7 +244,7 @@ impl App {
                 if let Some(server) = self.selected_mut() {
                     server.jar_path = jar_path;
                     self.save()?;
-                    self.status = "jar path updated".to_string();
+                    self.status = self.t(Text::JarUpdated).to_string();
                 }
                 self.input.clear();
                 self.mode = Mode::Normal;
@@ -224,7 +254,7 @@ impl App {
                 if let Some(server) = self.selected_mut() {
                     server.java_args = parts;
                     self.save()?;
-                    self.status = "java args updated".to_string();
+                    self.status = self.t(Text::JavaArgsUpdated).to_string();
                 }
                 self.input.clear();
                 self.mode = Mode::Normal;
@@ -234,7 +264,7 @@ impl App {
                 if let Some(server) = self.selected_mut() {
                     server.server_args = parts;
                     self.save()?;
-                    self.status = "server args updated".to_string();
+                    self.status = self.t(Text::ServerArgsUpdated).to_string();
                 }
                 self.input.clear();
                 self.mode = Mode::Normal;
@@ -244,13 +274,13 @@ impl App {
                 if !command.is_empty() {
                     if let Some(server) = self.selected() {
                         process::append_command(&self.store, server, &command)?;
-                        self.status = format!("sent command to {}", server.name);
+                        self.status = format!("{} {}", self.t(Text::SentCommand), server.name);
                     }
                 }
                 self.input.clear();
                 self.mode = Mode::Normal;
             }
-            Mode::Normal => {}
+            Mode::LanguageSelect | Mode::Normal => {}
         }
         Ok(())
     }
@@ -280,14 +310,14 @@ impl App {
         let removed = self.config.servers.remove(self.selected);
         self.selected = self.selected.saturating_sub(1);
         self.save()?;
-        self.status = format!("deleted {}", removed.name);
+        self.status = format!("{} {}", self.t(Text::Deleted), removed.name);
         Ok(())
     }
 
     fn start_selected(&mut self) -> Result<()> {
         if let Some(server) = self.selected() {
             process::start_supervisor(&self.store, server)?;
-            self.status = format!("started {}", server.name);
+            self.status = format!("{} {}", self.t(Text::Started), server.name);
         }
         Ok(())
     }
@@ -295,7 +325,7 @@ impl App {
     fn stop_selected(&mut self) -> Result<()> {
         if let Some(server) = self.selected() {
             process::stop_server(&self.store, server)?;
-            self.status = format!("stopped {}", server.name);
+            self.status = format!("{} {}", self.t(Text::Stopped), server.name);
         }
         Ok(())
     }
@@ -306,8 +336,13 @@ impl App {
             let enabled = server.auto_restart;
             self.save()?;
             self.status = format!(
-                "auto-restart {}",
-                if enabled { "enabled" } else { "disabled" }
+                "{} {}",
+                self.t(Text::AutoRestart),
+                if enabled {
+                    self.t(Text::Enabled)
+                } else {
+                    self.t(Text::Disabled)
+                }
             );
         }
         Ok(())
@@ -317,7 +352,7 @@ impl App {
         if let Some(server) = self.selected() {
             self.input = server.directory.to_string_lossy().to_string();
             self.mode = Mode::EditDir;
-            self.status = "edit directory:".to_string();
+            self.status = self.t(Text::EditDirectory).to_string();
         }
     }
 
@@ -325,7 +360,7 @@ impl App {
         if let Some(server) = self.selected() {
             self.input = server.jar_path.to_string_lossy().to_string();
             self.mode = Mode::EditJar;
-            self.status = "edit jar path:".to_string();
+            self.status = self.t(Text::EditJar).to_string();
         }
     }
 
@@ -333,7 +368,7 @@ impl App {
         if let Some(server) = self.selected() {
             self.input = server.java_args.join(" ");
             self.mode = Mode::EditJavaArgs;
-            self.status = "edit java args:".to_string();
+            self.status = self.t(Text::EditJavaArgs).to_string();
         }
     }
 
@@ -341,7 +376,7 @@ impl App {
         if let Some(server) = self.selected() {
             self.input = server.server_args.join(" ");
             self.mode = Mode::EditServerArgs;
-            self.status = "edit server args:".to_string();
+            self.status = self.t(Text::EditServerArgs).to_string();
         }
     }
 
@@ -349,31 +384,50 @@ impl App {
         if self.selected().is_some() {
             self.input.clear();
             self.mode = Mode::Command;
-            self.status = "send console command:".to_string();
+            self.status = self.t(Text::SendCommand).to_string();
         }
     }
 
     async fn fetch_versions(&mut self) {
-        self.status = "fetching Mojang versions...".to_string();
+        self.status = self.t(Text::FetchingVersions).to_string();
         match manifest::fetch_versions(12).await {
             Ok(versions) => {
+                let server_label = self.t(Text::Server).to_string();
+                let client_only_label = self.t(Text::ClientOnly).to_string();
                 self.versions = versions
                     .into_iter()
                     .map(|version| {
                         let server = if version.server_url.is_some() {
-                            "server"
+                            server_label.as_str()
                         } else {
-                            "client-only"
+                            client_only_label.as_str()
                         };
                         format!("{} ({}, {})", version.id, version.kind, server)
                     })
                     .collect();
-                self.status = "versions updated".to_string();
+                self.status = self.t(Text::VersionsUpdated).to_string();
             }
             Err(err) => {
-                self.status = format!("version fetch failed: {err}");
+                self.status = format!("{}: {err}", self.t(Text::VersionFetchFailed));
             }
         }
+    }
+
+    fn set_language(&mut self, language: Language) -> Result<()> {
+        self.language = language;
+        self.config.language = Some(language.code().to_string());
+        self.save()?;
+        self.mode = Mode::Normal;
+        self.status = format!(
+            "{}: {}",
+            self.t(Text::LanguageSaved),
+            language.display_name()
+        );
+        Ok(())
+    }
+
+    fn t(&self, key: Text) -> &'static str {
+        i18n::text(self.language, key)
     }
 
     fn save(&self) -> Result<()> {
@@ -383,6 +437,11 @@ impl App {
 
 fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    if matches!(app.mode, Mode::LanguageSelect) {
+        draw_language_select(frame, app, area);
+        return;
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -400,7 +459,8 @@ fn draw(frame: &mut Frame, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            "  config: {}",
+            "  {}: {}",
+            app.t(Text::Config),
             app.store.config_path().to_string_lossy()
         )),
     ]))
@@ -415,18 +475,56 @@ fn draw(frame: &mut Frame, app: &App) {
     draw_detail(frame, app, body[1]);
 
     let footer = Paragraph::new(app.status.as_str())
-        .block(Block::default().borders(Borders::ALL).title("Status"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(app.t(Text::Status)),
+        )
         .wrap(Wrap { trim: true });
     frame.render_widget(footer, chunks[2]);
 
-    if !matches!(app.mode, Mode::Normal) {
+    if !matches!(app.mode, Mode::Normal | Mode::LanguageSelect) {
         draw_input(frame, app, centered_rect(70, 20, area));
     }
 }
 
+fn draw_language_select(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(app.t(Text::LanguagePromptTitle));
+    let lines = vec![
+        Line::from(app.t(Text::LanguagePromptBody)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "1",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  English"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "2",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  简体中文"),
+        ]),
+        Line::from(""),
+        Line::from(app.t(Text::LanguagePromptHint)),
+    ];
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, centered_rect(70, 45, area));
+}
+
 fn draw_server_list(frame: &mut Frame, app: &App, area: Rect) {
     let items = if app.config.servers.is_empty() {
-        vec![ListItem::new("No servers. Press n to add one.")]
+        vec![ListItem::new(app.t(Text::NoServers))]
     } else {
         app.config
             .servers
@@ -439,7 +537,10 @@ fn draw_server_list(frame: &mut Frame, app: &App, area: Rect) {
                     process::RuntimeStatus::Stale => Color::Yellow,
                 };
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{:<8}", status.label()), Style::default().fg(color)),
+                    Span::styled(
+                        format!("{:<8}", status_label(app, status)),
+                        Style::default().fg(color),
+                    ),
                     Span::raw(format!(" {}", server.name)),
                 ]))
             })
@@ -452,7 +553,11 @@ fn draw_server_list(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Servers"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(app.t(Text::Servers)),
+        )
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
@@ -464,20 +569,46 @@ fn draw_server_list(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     let text = if let Some(server) = app.selected() {
         vec![
-            Line::from(format!("Name: {}", server.name)),
-            Line::from(format!("Id: {}", server.id)),
-            Line::from(format!("Directory: {}", server.directory.display())),
-            Line::from(format!("Jar: {}", server.jar_path.display())),
+            Line::from(format!("{}: {}", app.t(Text::Name), server.name)),
+            Line::from(format!("{}: {}", app.t(Text::Id), server.id)),
             Line::from(format!(
-                "Memory: {}M - {}M",
-                server.min_memory_mb, server.max_memory_mb
+                "{}: {}",
+                app.t(Text::Directory),
+                server.directory.display()
             )),
-            Line::from(format!("Java args: {}", server.java_args.join(" "))),
-            Line::from(format!("Server args: {}", server.server_args.join(" "))),
-            Line::from(format!("Auto restart: {}", server.auto_restart)),
-            Line::from(format!("Restart delay: {}s", server.restart_delay_secs)),
+            Line::from(format!(
+                "{}: {}",
+                app.t(Text::Jar),
+                server.jar_path.display()
+            )),
+            Line::from(format!(
+                "{}: {}M - {}M",
+                app.t(Text::Memory),
+                server.min_memory_mb,
+                server.max_memory_mb
+            )),
+            Line::from(format!(
+                "{}: {}",
+                app.t(Text::JavaArgs),
+                server.java_args.join(" ")
+            )),
+            Line::from(format!(
+                "{}: {}",
+                app.t(Text::ServerArgs),
+                server.server_args.join(" ")
+            )),
+            Line::from(format!(
+                "{}: {}",
+                app.t(Text::AutoRestartField),
+                server.auto_restart
+            )),
+            Line::from(format!(
+                "{}: {}s",
+                app.t(Text::RestartDelay),
+                server.restart_delay_secs
+            )),
             Line::from(""),
-            Line::from("Recent Mojang versions:"),
+            Line::from(format!("{}:", app.t(Text::RecentVersions))),
         ]
         .into_iter()
         .chain(
@@ -488,13 +619,17 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         .collect()
     } else {
         vec![
-            Line::from("Add a server with n."),
-            Line::from("Use a vanilla server.jar, Paper, Fabric, Forge, or any custom jar."),
+            Line::from(app.t(Text::AddServerHint)),
+            Line::from(app.t(Text::CustomJarHint)),
         ]
     };
 
     let paragraph = Paragraph::new(text)
-        .block(Block::default().borders(Borders::ALL).title("Details"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(app.t(Text::Details)),
+        )
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -502,20 +637,28 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Clear, area);
     let title = match app.mode {
-        Mode::AddName => "New server name",
-        Mode::AddDir => "New server directory",
-        Mode::AddJar => "Server jar path",
-        Mode::EditDir => "Edit directory",
-        Mode::EditJar => "Edit jar path",
-        Mode::EditJavaArgs => "Edit Java args",
-        Mode::EditServerArgs => "Edit server args",
-        Mode::Command => "Send command",
-        Mode::Normal => "",
+        Mode::AddName => app.t(Text::InputNewName),
+        Mode::AddDir => app.t(Text::InputNewDirectory),
+        Mode::AddJar => app.t(Text::InputJarPath),
+        Mode::EditDir => app.t(Text::InputEditDirectory),
+        Mode::EditJar => app.t(Text::InputEditJar),
+        Mode::EditJavaArgs => app.t(Text::InputEditJavaArgs),
+        Mode::EditServerArgs => app.t(Text::InputEditServerArgs),
+        Mode::Command => app.t(Text::InputSendCommand),
+        Mode::LanguageSelect | Mode::Normal => "",
     };
     let input = Paragraph::new(app.input.as_str())
         .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: false });
     frame.render_widget(input, area);
+}
+
+fn status_label(app: &App, status: process::RuntimeStatus) -> &'static str {
+    match status {
+        process::RuntimeStatus::Running => app.t(Text::Running),
+        process::RuntimeStatus::Stopped => app.t(Text::StoppedState),
+        process::RuntimeStatus::Stale => app.t(Text::Stale),
+    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {

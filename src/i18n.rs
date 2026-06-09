@@ -1,0 +1,231 @@
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Language {
+    English,
+    ChineseSimplified,
+}
+
+impl Language {
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "en" | "en-US" => Some(Self::English),
+            "zh-CN" | "zh" => Some(Self::ChineseSimplified),
+            _ => None,
+        }
+    }
+
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::English => "en",
+            Self::ChineseSimplified => "zh-CN",
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::English => "English",
+            Self::ChineseSimplified => "简体中文",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Text {
+    Help,
+    LanguageSaved,
+    LanguagePromptTitle,
+    LanguagePromptBody,
+    LanguagePromptHint,
+    Config,
+    Status,
+    Servers,
+    Details,
+    NoServers,
+    AddServerHint,
+    CustomJarHint,
+    ServerNamePrompt,
+    ServerDirPrompt,
+    ServerJarPrompt,
+    Cancelled,
+    ServerAdded,
+    DirectoryUpdated,
+    JarUpdated,
+    JavaArgsUpdated,
+    ServerArgsUpdated,
+    Deleted,
+    Started,
+    Stopped,
+    AutoRestart,
+    Enabled,
+    Disabled,
+    EditDirectory,
+    EditJar,
+    EditJavaArgs,
+    EditServerArgs,
+    SendCommand,
+    SentCommand,
+    FetchingVersions,
+    VersionsUpdated,
+    VersionFetchFailed,
+    Server,
+    ClientOnly,
+    Name,
+    Id,
+    Directory,
+    Jar,
+    Memory,
+    JavaArgs,
+    ServerArgs,
+    AutoRestartField,
+    RestartDelay,
+    RecentVersions,
+    InputNewName,
+    InputNewDirectory,
+    InputJarPath,
+    InputEditDirectory,
+    InputEditJar,
+    InputEditJavaArgs,
+    InputEditServerArgs,
+    InputSendCommand,
+    Running,
+    StoppedState,
+    Stale,
+}
+
+pub fn text(language: Language, key: Text) -> &'static str {
+    match language {
+        Language::English => english(key),
+        Language::ChineseSimplified => chinese_simplified(key),
+    }
+}
+
+fn english(key: Text) -> &'static str {
+    match key {
+        Text::Help => {
+            "n new | s start | x stop | c command | a auto-restart | e java args | g server args | p path | j jar | v versions | l language | d delete | q quit"
+        }
+        Text::LanguageSaved => "language saved",
+        Text::LanguagePromptTitle => "Language",
+        Text::LanguagePromptBody => "Choose the interface language before using remiaft.",
+        Text::LanguagePromptHint => "1 English | 2 简体中文 | q quit",
+        Text::Config => "config",
+        Text::Status => "Status",
+        Text::Servers => "Servers",
+        Text::Details => "Details",
+        Text::NoServers => "No servers. Press n to add one.",
+        Text::AddServerHint => "Add a server with n.",
+        Text::CustomJarHint => "Use a vanilla server.jar, Paper, Fabric, Forge, or any custom jar.",
+        Text::ServerNamePrompt => "server name:",
+        Text::ServerDirPrompt => "server directory:",
+        Text::ServerJarPrompt => "server jar path, relative to directory is ok:",
+        Text::Cancelled => "cancelled",
+        Text::ServerAdded => "server added",
+        Text::DirectoryUpdated => "directory updated",
+        Text::JarUpdated => "jar path updated",
+        Text::JavaArgsUpdated => "java args updated",
+        Text::ServerArgsUpdated => "server args updated",
+        Text::Deleted => "deleted",
+        Text::Started => "started",
+        Text::Stopped => "stopped",
+        Text::AutoRestart => "auto-restart",
+        Text::Enabled => "enabled",
+        Text::Disabled => "disabled",
+        Text::EditDirectory => "edit directory:",
+        Text::EditJar => "edit jar path:",
+        Text::EditJavaArgs => "edit java args:",
+        Text::EditServerArgs => "edit server args:",
+        Text::SendCommand => "send console command:",
+        Text::SentCommand => "sent command to",
+        Text::FetchingVersions => "fetching Mojang versions...",
+        Text::VersionsUpdated => "versions updated",
+        Text::VersionFetchFailed => "version fetch failed",
+        Text::Server => "server",
+        Text::ClientOnly => "client-only",
+        Text::Name => "Name",
+        Text::Id => "Id",
+        Text::Directory => "Directory",
+        Text::Jar => "Jar",
+        Text::Memory => "Memory",
+        Text::JavaArgs => "Java args",
+        Text::ServerArgs => "Server args",
+        Text::AutoRestartField => "Auto restart",
+        Text::RestartDelay => "Restart delay",
+        Text::RecentVersions => "Recent Mojang versions",
+        Text::InputNewName => "New server name",
+        Text::InputNewDirectory => "New server directory",
+        Text::InputJarPath => "Server jar path",
+        Text::InputEditDirectory => "Edit directory",
+        Text::InputEditJar => "Edit jar path",
+        Text::InputEditJavaArgs => "Edit Java args",
+        Text::InputEditServerArgs => "Edit server args",
+        Text::InputSendCommand => "Send command",
+        Text::Running => "running",
+        Text::StoppedState => "stopped",
+        Text::Stale => "stale",
+    }
+}
+
+fn chinese_simplified(key: Text) -> &'static str {
+    match key {
+        Text::Help => {
+            "n 新建 | s 启动 | x 停止 | c 命令 | a 自动重启 | e Java参数 | g 服务端参数 | p 目录 | j Jar | v 版本 | l 语言 | d 删除 | q 退出"
+        }
+        Text::LanguageSaved => "语言已保存",
+        Text::LanguagePromptTitle => "语言 / Language",
+        Text::LanguagePromptBody => "请选择 remiaft 管理界面语言。",
+        Text::LanguagePromptHint => "1 English | 2 简体中文 | q 退出",
+        Text::Config => "配置",
+        Text::Status => "状态",
+        Text::Servers => "服务器",
+        Text::Details => "详情",
+        Text::NoServers => "还没有服务器。按 n 添加。",
+        Text::AddServerHint => "按 n 添加服务器。",
+        Text::CustomJarHint => "可使用原版 server.jar、Paper、Fabric、Forge 或任意自定义 jar。",
+        Text::ServerNamePrompt => "服务器名称：",
+        Text::ServerDirPrompt => "服务器目录：",
+        Text::ServerJarPrompt => "服务端 jar 路径，可填写相对服务器目录的路径：",
+        Text::Cancelled => "已取消",
+        Text::ServerAdded => "服务器已添加",
+        Text::DirectoryUpdated => "目录已更新",
+        Text::JarUpdated => "jar 路径已更新",
+        Text::JavaArgsUpdated => "Java 参数已更新",
+        Text::ServerArgsUpdated => "服务端参数已更新",
+        Text::Deleted => "已删除",
+        Text::Started => "已启动",
+        Text::Stopped => "已停止",
+        Text::AutoRestart => "自动重启",
+        Text::Enabled => "已启用",
+        Text::Disabled => "已禁用",
+        Text::EditDirectory => "编辑目录：",
+        Text::EditJar => "编辑 jar 路径：",
+        Text::EditJavaArgs => "编辑 Java 参数：",
+        Text::EditServerArgs => "编辑服务端参数：",
+        Text::SendCommand => "发送控制台命令：",
+        Text::SentCommand => "已发送命令到",
+        Text::FetchingVersions => "正在获取 Mojang 版本...",
+        Text::VersionsUpdated => "版本列表已更新",
+        Text::VersionFetchFailed => "版本获取失败",
+        Text::Server => "服务端",
+        Text::ClientOnly => "仅客户端",
+        Text::Name => "名称",
+        Text::Id => "ID",
+        Text::Directory => "目录",
+        Text::Jar => "Jar",
+        Text::Memory => "内存",
+        Text::JavaArgs => "Java 参数",
+        Text::ServerArgs => "服务端参数",
+        Text::AutoRestartField => "自动重启",
+        Text::RestartDelay => "重启延迟",
+        Text::RecentVersions => "最近 Mojang 版本",
+        Text::InputNewName => "新服务器名称",
+        Text::InputNewDirectory => "新服务器目录",
+        Text::InputJarPath => "服务端 jar 路径",
+        Text::InputEditDirectory => "编辑目录",
+        Text::InputEditJar => "编辑 jar 路径",
+        Text::InputEditJavaArgs => "编辑 Java 参数",
+        Text::InputEditServerArgs => "编辑服务端参数",
+        Text::InputSendCommand => "发送命令",
+        Text::Running => "运行中",
+        Text::StoppedState => "已停止",
+        Text::Stale => "失效",
+    }
+}
