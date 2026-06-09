@@ -50,7 +50,12 @@ impl ConfigStore {
 
         let raw = fs::read_to_string(&self.config_path)
             .with_context(|| format!("read {}", self.config_path.display()))?;
-        toml::from_str(&raw).with_context(|| format!("parse {}", self.config_path.display()))
+        let mut config: RemiaftConfig = toml::from_str(&raw)
+            .with_context(|| format!("parse {}", self.config_path.display()))?;
+        if config.normalize_startup_commands() {
+            self.save(&config)?;
+        }
+        Ok(config)
     }
 
     pub fn save(&self, config: &RemiaftConfig) -> Result<()> {
@@ -88,6 +93,7 @@ impl RemiaftConfig {
             id,
             name,
             directory,
+            startup_command: None,
             jar_path,
             java_path: None,
             min_memory_mb: 1024,
@@ -106,6 +112,38 @@ impl RemiaftConfig {
             .find(|server| server.id == key || server.name == key)
             .ok_or_else(|| anyhow!("unknown server: {key}"))
     }
+
+    fn normalize_startup_commands(&mut self) -> bool {
+        let mut changed = false;
+        for server in &mut self.servers {
+            if let Some(jar_index) = server.java_args.iter().position(|part| part == "-jar") {
+                if let Some(first) = server.java_args.first() {
+                    if looks_like_java_bin(first) {
+                        server.java_path = Some(first.clone());
+                    }
+                }
+                if let Some(jar_path) = server.java_args.get(jar_index + 1) {
+                    server.jar_path = PathBuf::from(jar_path);
+                }
+                server.server_args = server
+                    .java_args
+                    .get(jar_index + 2..)
+                    .unwrap_or_default()
+                    .to_vec();
+                let java_arg_start = usize::from(
+                    server
+                        .java_args
+                        .first()
+                        .map(|part| looks_like_java_bin(part))
+                        .unwrap_or(false),
+                );
+                server.java_args = server.java_args[java_arg_start..jar_index].to_vec();
+                server.startup_command = Some(server.startup_command(&self.java_path));
+                changed = true;
+            }
+        }
+        changed
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +151,8 @@ pub struct ServerConfig {
     pub id: String,
     pub name: String,
     pub directory: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_command: Option<String>,
     pub jar_path: PathBuf,
     pub java_path: Option<String>,
     pub min_memory_mb: u32,
@@ -127,6 +167,19 @@ pub struct ServerConfig {
 impl ServerConfig {
     pub fn java_bin<'a>(&'a self, default: &'a str) -> &'a str {
         self.java_path.as_deref().unwrap_or(default)
+    }
+
+    pub fn startup_command(&self, default_java: &str) -> String {
+        let mut parts = vec![
+            self.java_bin(default_java).to_string(),
+            format!("-Xms{}M", self.min_memory_mb),
+            format!("-Xmx{}M", self.max_memory_mb),
+        ];
+        parts.extend(self.java_args.clone());
+        parts.push("-jar".to_string());
+        parts.push(self.jar_path.to_string_lossy().to_string());
+        parts.extend(self.server_args.clone());
+        parts.join(" ")
     }
 }
 
@@ -155,6 +208,14 @@ fn slug(input: &str) -> String {
     } else {
         cleaned
     }
+}
+
+fn looks_like_java_bin(value: &str) -> bool {
+    let name = Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(value);
+    name == "java" || name.starts_with("java")
 }
 
 #[cfg(test)]

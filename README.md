@@ -58,6 +58,7 @@ TUI to change language later.
 Inside the TUI:
 
 ```text
+u edit the startup command, for example: java -Xms1G -Xmx4G -jar server.jar nogui
 o open/close live console for the selected server
 i send console command
 b show/hide the right side panel
@@ -78,6 +79,10 @@ v fetch recent Mojang versions
 d delete selected server
 q quit
 ```
+
+The startup command is the normal terminal command you would run by hand.
+`remiaft` parses it into Java path, memory flags, jar path, JVM args, and server
+args, then keeps managing it without requiring `screen`.
 
 ## Runtime Model
 

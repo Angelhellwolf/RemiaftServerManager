@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{self, Stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -76,11 +76,13 @@ enum Mode {
     Normal,
     AddName,
     AddDir,
-    AddJar,
+    AddStartupCommand,
     EditDir,
     EditJar,
+    EditJavaPath,
     EditJavaArgs,
     EditServerArgs,
+    EditStartupCommand,
     Command,
 }
 
@@ -93,7 +95,7 @@ enum MainView {
 struct Draft {
     name: String,
     dir: String,
-    jar: String,
+    startup_command: String,
 }
 
 struct App {
@@ -112,6 +114,7 @@ struct App {
     console_lines: Vec<String>,
     console_end: Option<usize>,
     console_follow: bool,
+    console_input: String,
 }
 
 impl App {
@@ -134,7 +137,7 @@ impl App {
             draft: Draft {
                 name: String::new(),
                 dir: String::new(),
-                jar: "server.jar".to_string(),
+                startup_command: "java -Xms1024M -Xmx4096M -jar server.jar nogui".to_string(),
             },
             status: i18n::text(language, Text::Help).to_string(),
             versions: Vec::new(),
@@ -144,6 +147,7 @@ impl App {
             console_lines: Vec::new(),
             console_end: None,
             console_follow: true,
+            console_input: String::new(),
         })
     }
 
@@ -154,6 +158,9 @@ impl App {
 
         match self.mode {
             Mode::LanguageSelect => self.handle_language_key(key),
+            Mode::Normal if self.main_view == MainView::Console => {
+                self.handle_console_key(key).await
+            }
             Mode::Normal => self.handle_normal_key(key).await,
             _ => self.handle_input_key(key),
         }
@@ -195,6 +202,8 @@ impl App {
             KeyCode::Char('a') => self.toggle_auto_restart()?,
             KeyCode::Char('p') => self.begin_edit_dir(),
             KeyCode::Char('j') => self.begin_edit_jar(),
+            KeyCode::Char('u') => self.begin_edit_startup_command(),
+            KeyCode::Char('y') => self.begin_edit_java_path(),
             KeyCode::Char('e') => self.begin_edit_java_args(),
             KeyCode::Char('g') => self.begin_edit_server_args(),
             KeyCode::Char('c') => self.begin_command(),
@@ -208,6 +217,41 @@ impl App {
             KeyCode::Char('l') => {
                 self.mode = Mode::LanguageSelect;
                 self.status = i18n::text(self.language, Text::LanguagePromptHint).to_string();
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    async fn handle_console_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc => {
+                if self.console_input.is_empty() {
+                    self.main_view = MainView::Details;
+                    self.status = self.t(Text::Help).to_string();
+                } else {
+                    self.console_input.clear();
+                }
+            }
+            KeyCode::Enter => self.send_console_input()?,
+            KeyCode::Backspace | KeyCode::Char('h')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.code == KeyCode::Backspace =>
+            {
+                self.console_input.pop();
+            }
+            KeyCode::Up => self.scroll_console(-1),
+            KeyCode::Down => self.scroll_console(1),
+            KeyCode::PageUp => self.scroll_console_page(-1),
+            KeyCode::PageDown => self.scroll_console_page(1),
+            KeyCode::End => self.follow_console(),
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.toggle_details()
+            }
+            KeyCode::Char(ch)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                self.console_input.push(ch);
             }
             _ => {}
         }
@@ -248,16 +292,30 @@ impl App {
             }
             Mode::AddDir => {
                 self.draft.dir = self.input.trim().to_string();
-                self.input = self.draft.jar.clone();
-                self.mode = Mode::AddJar;
-                self.status = self.t(Text::ServerJarPrompt).to_string();
+                self.input = self.draft.startup_command.clone();
+                self.mode = Mode::AddStartupCommand;
+                self.status = self.t(Text::StartupCommandPrompt).to_string();
             }
-            Mode::AddJar => {
-                self.draft.jar = fallback(self.input.trim(), "server.jar").to_string();
+            Mode::AddStartupCommand => {
+                self.draft.startup_command = fallback(
+                    self.input.trim(),
+                    "java -Xms1024M -Xmx4096M -jar server.jar nogui",
+                )
+                .to_string();
                 let name = fallback(&self.draft.name, "Minecraft Server").to_string();
                 let dir = PathBuf::from(fallback(&self.draft.dir, "."));
-                let jar = PathBuf::from(&self.draft.jar);
-                self.config.add_server(name, dir, jar);
+                let parsed = parse_startup_command(&self.draft.startup_command, &dir);
+                self.config.add_server(
+                    name,
+                    dir,
+                    parsed
+                        .jar_path
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from("server.jar")),
+                );
+                if let Some(server) = self.config.servers.last_mut() {
+                    apply_startup_command(server, parsed, &self.draft.startup_command);
+                }
                 self.save()?;
                 self.selected = self.config.servers.len().saturating_sub(1);
                 self.input.clear();
@@ -284,13 +342,61 @@ impl App {
                 self.input.clear();
                 self.mode = Mode::Normal;
             }
-            Mode::EditJavaArgs => {
-                let parts = split_args(&self.input);
+            Mode::EditJavaPath => {
+                let java_path = self.input.trim().to_string();
                 if let Some(server) = self.selected_mut() {
-                    server.java_args = parts;
+                    server.java_path = if java_path.is_empty() {
+                        None
+                    } else {
+                        Some(java_path)
+                    };
                     self.save()?;
                     self.status = self.t(Text::JavaArgsUpdated).to_string();
                 }
+                self.input.clear();
+                self.mode = Mode::Normal;
+            }
+            Mode::EditJavaArgs => {
+                let parts = split_args(&self.input);
+                if let Some(server) = self.selected_mut() {
+                    let normalized = normalize_startup_parts(parts);
+                    server.java_path = normalized.java_path.or_else(|| server.java_path.clone());
+                    server.jar_path = normalized
+                        .jar_path
+                        .unwrap_or_else(|| server.jar_path.clone());
+                    if let Some(min_memory_mb) = normalized.min_memory_mb {
+                        server.min_memory_mb = min_memory_mb;
+                    }
+                    if let Some(max_memory_mb) = normalized.max_memory_mb {
+                        server.max_memory_mb = max_memory_mb;
+                    }
+                    server.java_args = normalized.java_args;
+                    if !normalized.server_args.is_empty() {
+                        server.server_args = normalized.server_args;
+                    }
+                    self.save()?;
+                    self.status = if normalized.changed {
+                        self.t(Text::StartupCommandNormalized).to_string()
+                    } else {
+                        self.t(Text::JavaArgsUpdated).to_string()
+                    };
+                }
+                self.input.clear();
+                self.mode = Mode::Normal;
+            }
+            Mode::EditStartupCommand => {
+                let command = self.input.trim().to_string();
+                let Some(selected) = self.selected_index() else {
+                    self.input.clear();
+                    self.mode = Mode::Normal;
+                    return Ok(());
+                };
+                let directory = self.config.servers[selected].directory.clone();
+                let parsed = parse_startup_command(&command, &directory);
+                let server = &mut self.config.servers[selected];
+                apply_startup_command(server, parsed, &command);
+                self.save()?;
+                self.status = self.t(Text::StartupCommandUpdated).to_string();
                 self.input.clear();
                 self.mode = Mode::Normal;
             }
@@ -335,6 +441,10 @@ impl App {
 
     fn selected(&self) -> Option<&crate::config::ServerConfig> {
         self.config.servers.get(self.selected)
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        (self.selected < self.config.servers.len()).then_some(self.selected)
     }
 
     fn selected_mut(&mut self) -> Option<&mut crate::config::ServerConfig> {
@@ -402,11 +512,31 @@ impl App {
         }
     }
 
+    fn begin_edit_java_path(&mut self) {
+        let default_java = self.config.java_path.clone();
+        if let Some(server) = self.selected() {
+            self.input = server.java_path.clone().unwrap_or(default_java);
+            self.mode = Mode::EditJavaPath;
+            self.status = self.t(Text::EditJavaPath).to_string();
+        }
+    }
+
     fn begin_edit_java_args(&mut self) {
         if let Some(server) = self.selected() {
             self.input = server.java_args.join(" ");
             self.mode = Mode::EditJavaArgs;
             self.status = self.t(Text::EditJavaArgs).to_string();
+        }
+    }
+
+    fn begin_edit_startup_command(&mut self) {
+        if let Some(server) = self.selected() {
+            self.input = server
+                .startup_command
+                .clone()
+                .unwrap_or_else(|| server.startup_command(&self.config.java_path));
+            self.mode = Mode::EditStartupCommand;
+            self.status = self.t(Text::EditStartupCommand).to_string();
         }
     }
 
@@ -424,6 +554,20 @@ impl App {
             self.mode = Mode::Command;
             self.status = self.t(Text::SendCommand).to_string();
         }
+    }
+
+    fn send_console_input(&mut self) -> Result<()> {
+        let command = self.console_input.trim().to_string();
+        if command.is_empty() {
+            return Ok(());
+        }
+        if let Some(server) = self.selected() {
+            process::append_command(&self.store, server, &command)?;
+            self.status = format!("{} {}", self.t(Text::SentCommand), server.name);
+        }
+        self.console_input.clear();
+        self.follow_console();
+        Ok(())
     }
 
     fn toggle_console(&mut self) {
@@ -760,6 +904,19 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
                 server.jar_path.display()
             )),
             Line::from(format!(
+                "{}: {}",
+                app.t(Text::JavaPath),
+                server.java_bin(&app.config.java_path)
+            )),
+            Line::from(format!(
+                "{}: {}",
+                app.t(Text::StartupCommand),
+                server
+                    .startup_command
+                    .clone()
+                    .unwrap_or_else(|| server.startup_command(&app.config.java_path))
+            )),
+            Line::from(format!(
                 "{}: {}M - {}M",
                 app.t(Text::Memory),
                 server.min_memory_mb,
@@ -813,6 +970,10 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_console(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .split(area);
     let title = if let Some(server) = app.selected() {
         let mode = if app.console_follow {
             app.t(Text::ConsoleFollow)
@@ -823,12 +984,21 @@ fn draw_console(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         app.t(Text::Console).to_string()
     };
-    let height = area.height.saturating_sub(2).max(1) as usize;
+    let height = chunks[0].height.saturating_sub(2).max(1) as usize;
     let lines = app.console_visible_lines(height);
     let paragraph = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, area);
+    frame.render_widget(paragraph, chunks[0]);
+
+    let input = Paragraph::new(app.console_input.as_str())
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            "{} - {}",
+            app.t(Text::ConsoleInput),
+            app.t(Text::ConsoleExitHint)
+        )))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(input, chunks[1]);
 }
 
 fn draw_quick_panel(frame: &mut Frame, app: &App, area: Rect) {
@@ -903,6 +1073,8 @@ fn shortcut_lines(app: &App) -> Vec<Line<'static>> {
             Line::from("c  console command"),
             Line::from("a  auto-restart"),
             Line::from("e  Java args"),
+            Line::from("y  Java path"),
+            Line::from("u  startup command"),
             Line::from("g  server args"),
             Line::from("p  directory"),
             Line::from("j  jar path"),
@@ -923,6 +1095,8 @@ fn shortcut_lines(app: &App) -> Vec<Line<'static>> {
             Line::from("c  控制台命令"),
             Line::from("a  自动重启"),
             Line::from("e  Java 参数"),
+            Line::from("y  Java 路径"),
+            Line::from("u  启动命令"),
             Line::from("g  服务端参数"),
             Line::from("p  服务器目录"),
             Line::from("j  Jar 路径"),
@@ -939,10 +1113,12 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     let title = match app.mode {
         Mode::AddName => app.t(Text::InputNewName),
         Mode::AddDir => app.t(Text::InputNewDirectory),
-        Mode::AddJar => app.t(Text::InputJarPath),
+        Mode::AddStartupCommand => app.t(Text::StartupCommand),
         Mode::EditDir => app.t(Text::InputEditDirectory),
         Mode::EditJar => app.t(Text::InputEditJar),
+        Mode::EditJavaPath => app.t(Text::InputEditJavaPath),
         Mode::EditJavaArgs => app.t(Text::InputEditJavaArgs),
+        Mode::EditStartupCommand => app.t(Text::StartupCommand),
         Mode::EditServerArgs => app.t(Text::InputEditServerArgs),
         Mode::Command => app.t(Text::InputSendCommand),
         Mode::LanguageSelect | Mode::Normal => "",
@@ -1023,4 +1199,130 @@ fn split_args(input: &str) -> Vec<String> {
     }
 
     args
+}
+
+struct NormalizedStartup {
+    java_path: Option<String>,
+    jar_path: Option<PathBuf>,
+    min_memory_mb: Option<u32>,
+    max_memory_mb: Option<u32>,
+    java_args: Vec<String>,
+    server_args: Vec<String>,
+    changed: bool,
+}
+
+fn parse_startup_command(command: &str, _server_dir: &Path) -> NormalizedStartup {
+    normalize_startup_parts(split_args(command))
+}
+
+fn apply_startup_command(
+    server: &mut crate::config::ServerConfig,
+    parsed: NormalizedStartup,
+    command: &str,
+) {
+    if let Some(java_path) = parsed.java_path {
+        server.java_path = Some(java_path);
+    }
+    if let Some(jar_path) = parsed.jar_path {
+        server.jar_path = jar_path;
+    }
+    if let Some(min_memory_mb) = parsed.min_memory_mb {
+        server.min_memory_mb = min_memory_mb;
+    }
+    if let Some(max_memory_mb) = parsed.max_memory_mb {
+        server.max_memory_mb = max_memory_mb;
+    }
+    server.java_args = parsed.java_args;
+    server.server_args = parsed.server_args;
+    server.startup_command = Some(command.to_string());
+}
+
+fn normalize_startup_parts(parts: Vec<String>) -> NormalizedStartup {
+    let Some(jar_index) = parts.iter().position(|part| part == "-jar") else {
+        return NormalizedStartup {
+            java_path: None,
+            jar_path: None,
+            min_memory_mb: None,
+            max_memory_mb: None,
+            java_args: parts,
+            server_args: Vec::new(),
+            changed: false,
+        };
+    };
+
+    let java_path = parts
+        .first()
+        .filter(|part| looks_like_java_bin(part))
+        .cloned();
+    let java_arg_start = usize::from(java_path.is_some());
+    let jar_path = parts.get(jar_index + 1).map(PathBuf::from);
+    let mut min_memory_mb = None;
+    let mut max_memory_mb = None;
+    let mut java_args = Vec::new();
+    for arg in &parts[java_arg_start..jar_index] {
+        if let Some(value) = arg.strip_prefix("-Xms").and_then(parse_memory_mb) {
+            min_memory_mb = Some(value);
+        } else if let Some(value) = arg.strip_prefix("-Xmx").and_then(parse_memory_mb) {
+            max_memory_mb = Some(value);
+        } else {
+            java_args.push(arg.clone());
+        }
+    }
+    let server_args = parts.get(jar_index + 2..).unwrap_or(&[]).to_vec();
+
+    NormalizedStartup {
+        java_path,
+        jar_path,
+        min_memory_mb,
+        max_memory_mb,
+        java_args,
+        server_args,
+        changed: true,
+    }
+}
+
+fn parse_memory_mb(value: &str) -> Option<u32> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let (number, multiplier) = match value
+        .chars()
+        .last()
+        .map(|ch| ch.to_ascii_uppercase())
+        .unwrap_or('M')
+    {
+        'G' => (&value[..value.len() - 1], 1024),
+        'M' => (&value[..value.len() - 1], 1),
+        _ => (value, 1),
+    };
+    number.parse::<u32>().ok().map(|mb| mb * multiplier)
+}
+
+fn looks_like_java_bin(value: &str) -> bool {
+    let name = Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(value);
+    name == "java" || name.starts_with("java")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_full_startup_command() {
+        let parsed = parse_startup_command(
+            "java25 -Xms1G -Xmx4096M -Dfoo=bar -jar velocity.jar nogui",
+            Path::new("."),
+        );
+
+        assert_eq!(parsed.java_path.as_deref(), Some("java25"));
+        assert_eq!(parsed.min_memory_mb, Some(1024));
+        assert_eq!(parsed.max_memory_mb, Some(4096));
+        assert_eq!(parsed.jar_path.as_deref(), Some(Path::new("velocity.jar")));
+        assert_eq!(parsed.java_args, vec!["-Dfoo=bar"]);
+        assert_eq!(parsed.server_args, vec!["nogui"]);
+    }
 }
