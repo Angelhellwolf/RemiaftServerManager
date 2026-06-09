@@ -46,7 +46,7 @@ asset="$(asset_name)"
 url="https://github.com/$REPO/releases/latest/download/$asset"
 
 echo "Installing remiaft from $url"
-if ! curl -fL "$url" -o "$TMP_DIR/remiaft"; then
+if ! curl --retry 5 --retry-delay 2 --retry-all-errors -fL "$url" -o "$TMP_DIR/remiaft"; then
     echo "failed to download release asset" >&2
     echo "if this repository has no release yet, build from source:" >&2
     echo "  cargo install --git https://github.com/$REPO.git" >&2
