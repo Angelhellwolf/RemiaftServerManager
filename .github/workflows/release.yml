@@ -1,6 +1,7 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v*"
@@ -38,10 +39,23 @@ jobs:
       - name: Package Windows
         if: runner.os == 'Windows'
         run: copy target\${{ matrix.target }}\release\remiaft.exe ${{ matrix.artifact }}
+      - name: Checksum Unix
+        if: runner.os != 'Windows'
+        run: shasum -a 256 ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
+      - name: Checksum Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 $env:ARTIFACT).Hash.ToLower()
+          "$hash  $env:ARTIFACT" | Out-File -Encoding ascii "$env:ARTIFACT.sha256"
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}
+            ${{ matrix.artifact }}.sha256
 
   publish:
     name: Publish GitHub Release

@@ -3,8 +3,8 @@ name = "remiaft"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Terminal Minecraft server manager without screen/tmux"
-repository = "https://github.com/your-name/remiaft"
+description = "Modern self-hosted Minecraft server manager for Remiaft"
+repository = "https://github.com/Angelhellwolf/RemiaftServerManager"
 
 [dependencies]
 anyhow = "1"

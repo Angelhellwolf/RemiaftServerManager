@@ -1,7 +1,8 @@
 # remiaft
 
-`remiaft` is a Rust terminal manager for Minecraft Java servers. It is designed
-to run as a normal user, without `screen`, `tmux`, or root privileges.
+`RemiaftServerManager` is a modern self-hosted Minecraft server manager for
+Remiaft. It is designed to run as a normal user, without `screen`, `tmux`, or
+root privileges.
 
 ## Goals
 
@@ -13,19 +14,31 @@ to run as a normal user, without `screen`, `tmux`, or root privileges.
 - Keep runtime state under the user's local data directory.
 - Ship with GitHub CI and tagged release artifacts.
 
-## Install Locally
+## One-Line Install
 
 ```sh
-./scripts/install.sh
+curl -fsSL https://raw.githubusercontent.com/Angelhellwolf/RemiaftServerManager/master/scripts/install-remote.sh | sh
 ```
 
-The installer builds the release binary and writes it to:
+The installer downloads the latest GitHub Release binary and writes it to:
 
 ```text
 $HOME/.local/bin/remiaft
 ```
 
 Make sure `$HOME/.local/bin` is on `PATH`.
+
+## Install From Source
+
+```sh
+./scripts/install.sh
+```
+
+The local installer builds the release binary and writes it to:
+
+```text
+$HOME/.local/bin/remiaft
+```
 
 ## Usage
 
