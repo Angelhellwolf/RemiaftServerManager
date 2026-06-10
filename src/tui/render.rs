@@ -586,7 +586,7 @@ fn shortcut_lines(app: &App) -> Vec<Line<'static>> {
             Line::from("j  jar path"),
             Line::from("v  versions"),
             Line::from("l  language"),
-            Line::from("d  delete"),
+            Line::from("d  delete item"),
             Line::from("q  quit UI"),
         ],
         Language::ChineseSimplified => vec![
@@ -615,7 +615,7 @@ fn shortcut_lines(app: &App) -> Vec<Line<'static>> {
             Line::from("j  Jar 路径"),
             Line::from("v  版本列表"),
             Line::from("l  语言"),
-            Line::from("d  删除"),
+            Line::from("d  删除项目"),
             Line::from("q  退出界面"),
         ],
     }

@@ -130,16 +130,16 @@ fn english(key: Text) -> &'static str {
         Text::Shortcuts => "Shortcuts",
         Text::SelectedServer => "Selected server",
         Text::NoServerSelected => "No server selected",
-        Text::ManagerExitHint => "Ctrl-C/q exits the UI only. Running servers stay online.",
+        Text::ManagerExitHint => "q exits the UI. Ctrl-C exits outside the console.",
         Text::Console => "Console",
         Text::ConsoleHint => {
-            "o console | type command | Enter send | Ctrl-U detach | Up/Down scroll | End follow"
+            "o console | Enter send | Ctrl-C interrupt | Ctrl-U detach | Up/Down scroll | End follow"
         }
         Text::ConsoleFollow => "following live output",
         Text::ConsolePaused => "manual scroll; new output will not move the view",
         Text::ConsoleEmpty => "No console output yet.",
         Text::ConsoleInput => "Command",
-        Text::ConsoleExitHint => "Type commands directly. Enter sends. Ctrl-U detaches.",
+        Text::ConsoleExitHint => "Enter sends. Ctrl-C interrupts the server. Ctrl-U detaches.",
         Text::DetailPanelHidden => "details hidden",
         Text::JavaPath => "Java path",
         Text::EditJavaPath => "edit Java path:",
@@ -215,16 +215,16 @@ fn chinese_simplified(key: Text) -> &'static str {
         Text::Shortcuts => "快捷键",
         Text::SelectedServer => "当前服务器",
         Text::NoServerSelected => "未选择服务器",
-        Text::ManagerExitHint => "Ctrl-C/q 只退出界面，运行中的服务器会继续在线。",
+        Text::ManagerExitHint => "q 退出界面；Ctrl-C 在非控制台界面退出。",
         Text::Console => "控制台",
         Text::ConsoleHint => {
-            "o 控制台 | 直接输入命令 | Enter 发送 | Ctrl-U 脱离 | ↑/↓ 滚动 | End 跟随"
+            "o 控制台 | Enter 发送 | Ctrl-C 中断服务器 | Ctrl-U 脱离 | ↑/↓ 滚动 | End 跟随"
         }
         Text::ConsoleFollow => "正在跟随实时输出",
         Text::ConsolePaused => "手动滚动中，新输出不会移动视图",
         Text::ConsoleEmpty => "暂无控制台输出。",
         Text::ConsoleInput => "命令",
-        Text::ConsoleExitHint => "可直接输入命令，Enter 发送，Ctrl-U 脱离控制台。",
+        Text::ConsoleExitHint => "Enter 发送，Ctrl-C 中断服务器，Ctrl-U 脱离控制台。",
         Text::DetailPanelHidden => "详情面板已隐藏",
         Text::JavaPath => "Java 路径",
         Text::EditJavaPath => "编辑 Java 路径：",

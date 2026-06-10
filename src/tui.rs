@@ -162,6 +162,10 @@ impl App {
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if matches!(self.mode, Mode::Normal) && self.main_view == MainView::Console {
+                self.interrupt_console_server()?;
+                return Ok(false);
+            }
             return Ok(true);
         }
 
@@ -633,14 +637,43 @@ impl App {
     }
 
     fn delete_selected(&mut self) -> Result<()> {
-        let Some(index) = self.selected_server_index() else {
+        if let Some(index) = self.selected_server_index() {
+            let removed = self.config.servers.remove(index);
+            self.marked_servers.remove(&removed.id);
+            self.clamp_selection();
+            self.save()?;
+            self.status = format!("{} {}", self.t(Text::Deleted), removed.name);
+            return Ok(());
+        }
+        if let Some(group_id) = self.selected_group_id() {
+            self.delete_group(&group_id)?;
+        }
+        Ok(())
+    }
+
+    fn delete_group(&mut self, group_id: &str) -> Result<()> {
+        let Some(deleted) = self.config.delete_group_preserving_servers(group_id) else {
             return Ok(());
         };
-        let removed = self.config.servers.remove(index);
-        self.marked_servers.remove(&removed.id);
+        let removed_group_ids = deleted
+            .removed_group_ids
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        self.expanded_groups
+            .retain(|group_id| !removed_group_ids.contains(group_id));
         self.clamp_selection();
         self.save()?;
-        self.status = format!("{} {}", self.t(Text::Deleted), removed.name);
+        self.status = match self.language {
+            Language::English => format!(
+                "deleted group {}; moved {} server(s)",
+                deleted.name, deleted.moved_server_count
+            ),
+            Language::ChineseSimplified => format!(
+                "已删除分组 {}；移动 {} 个服务器",
+                deleted.name, deleted.moved_server_count
+            ),
+        };
         Ok(())
     }
 
@@ -957,6 +990,24 @@ impl App {
         };
         process::append_terminal_input(&self.store, &server, input)?;
         Ok(true)
+    }
+
+    fn interrupt_console_server(&mut self) -> Result<()> {
+        let Some(server) = self.selected().cloned() else {
+            return Ok(());
+        };
+        if process::runtime_status(&self.store, &server) != process::RuntimeStatus::Running {
+            return Ok(());
+        }
+        process::interrupt_server(&self.store, &server)?;
+        self.clear_console_input();
+        self.console_follow = true;
+        self.console_end = None;
+        self.status = match self.language {
+            Language::English => format!("sent Ctrl-C to {}", server.name),
+            Language::ChineseSimplified => format!("已向 {} 发送 Ctrl-C", server.name),
+        };
+        Ok(())
     }
 
     fn queue_screen_clear(&mut self) {

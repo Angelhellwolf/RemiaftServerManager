@@ -63,6 +63,7 @@ o open/close live console for the selected server
 type in the console and press Enter to send a command
 Tab in the live console is forwarded to the running server terminal, so Unix PTY
 servers use the same completion path as the vanilla Minecraft console
+Ctrl-C in the live console sends an interrupt to the selected server
 Ctrl-U detach from the console view without stopping the server
 b show/hide the right side panel
 Up/Down scroll console output when console is open
@@ -79,7 +80,7 @@ g edit Minecraft server args
 p edit server directory
 j edit jar path
 v fetch recent Mojang versions
-d delete selected server
+d delete selected server/group
 q quit
 ```
 

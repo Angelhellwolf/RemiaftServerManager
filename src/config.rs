@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -147,6 +148,51 @@ impl RemiaftConfig {
         last_id
     }
 
+    pub fn delete_group_preserving_servers(&mut self, group_id: &str) -> Option<DeletedGroup> {
+        let group = self
+            .groups
+            .iter()
+            .find(|group| group.id == group_id)
+            .cloned()?;
+        let mut removed_group_ids = vec![group.id.clone()];
+        self.collect_descendant_group_ids(group_id, &mut removed_group_ids);
+        let removed_groups = removed_group_ids.iter().cloned().collect::<HashSet<_>>();
+
+        let mut moved_server_count = 0;
+        for server in &mut self.servers {
+            if server
+                .group_id
+                .as_ref()
+                .is_some_and(|id| removed_groups.contains(id))
+            {
+                server.group_id = group.parent_id.clone();
+                moved_server_count += 1;
+            }
+        }
+
+        self.groups
+            .retain(|group| !removed_groups.contains(&group.id));
+
+        Some(DeletedGroup {
+            name: group.name,
+            removed_group_ids,
+            moved_server_count,
+        })
+    }
+
+    fn collect_descendant_group_ids(&self, group_id: &str, output: &mut Vec<String>) {
+        let child_ids = self
+            .groups
+            .iter()
+            .filter(|group| group.parent_id.as_deref() == Some(group_id))
+            .map(|group| group.id.clone())
+            .collect::<Vec<_>>();
+        for child_id in child_ids {
+            output.push(child_id.clone());
+            self.collect_descendant_group_ids(&child_id, output);
+        }
+    }
+
     fn normalize_startup_commands(&mut self) -> bool {
         let mut changed = false;
         for server in &mut self.servers {
@@ -195,6 +241,13 @@ impl RemiaftConfig {
         }
         changed
     }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DeletedGroup {
+    pub name: String,
+    pub removed_group_ids: Vec<String>,
+    pub moved_server_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,5 +340,62 @@ mod tests {
     fn slug_has_stable_fallback() {
         assert_eq!(slug("Survival SMP"), "survival-smp");
         assert_eq!(slug("***"), "server");
+    }
+
+    #[test]
+    fn deleting_group_preserves_servers_under_parent() {
+        let mut config = RemiaftConfig::default();
+        config.groups = vec![
+            ServerGroup {
+                id: "root".to_string(),
+                name: "root".to_string(),
+                parent_id: None,
+            },
+            ServerGroup {
+                id: "child".to_string(),
+                name: "child".to_string(),
+                parent_id: Some("root".to_string()),
+            },
+            ServerGroup {
+                id: "sibling".to_string(),
+                name: "sibling".to_string(),
+                parent_id: None,
+            },
+        ];
+        config.add_server(
+            "root server".to_string(),
+            PathBuf::from("."),
+            PathBuf::from("server.jar"),
+        );
+        config.add_server(
+            "child server".to_string(),
+            PathBuf::from("."),
+            PathBuf::from("server.jar"),
+        );
+        config.add_server(
+            "sibling server".to_string(),
+            PathBuf::from("."),
+            PathBuf::from("server.jar"),
+        );
+        config.servers[0].group_id = Some("root".to_string());
+        config.servers[1].group_id = Some("child".to_string());
+        config.servers[2].group_id = Some("sibling".to_string());
+
+        let deleted = config.delete_group_preserving_servers("root").unwrap();
+
+        assert_eq!(deleted.name, "root");
+        assert_eq!(deleted.removed_group_ids, vec!["root", "child"]);
+        assert_eq!(deleted.moved_server_count, 2);
+        assert_eq!(
+            config
+                .groups
+                .iter()
+                .map(|group| group.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sibling"]
+        );
+        assert_eq!(config.servers[0].group_id, None);
+        assert_eq!(config.servers[1].group_id, None);
+        assert_eq!(config.servers[2].group_id.as_deref(), Some("sibling"));
     }
 }

@@ -17,7 +17,6 @@ use crate::config::{ConfigStore, ServerConfig};
 
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
-const CTRL_C_FALLBACK_DELAY: Duration = Duration::from_secs(10);
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[cfg(unix)]
@@ -81,14 +80,9 @@ pub fn stop_server(store: &ConfigStore, server: &ServerConfig) -> Result<()> {
     append_command(store, server, "stop")?;
 
     let start = Instant::now();
-    let mut sent_interrupt = false;
     while start.elapsed() < STOP_TIMEOUT {
         if runtime_status(store, server) != RuntimeStatus::Running {
             return Ok(());
-        }
-        if !sent_interrupt && start.elapsed() >= CTRL_C_FALLBACK_DELAY {
-            let _ = append_terminal_input(store, server, "\u{3}");
-            sent_interrupt = true;
         }
         thread::sleep(STOP_POLL_INTERVAL);
     }
@@ -99,6 +93,13 @@ pub fn stop_server(store: &ConfigStore, server: &ServerConfig) -> Result<()> {
     if let Some(pid) = read_pid(&supervisor_pid_path(store, server))? {
         kill_pid(pid)?;
     }
+    Ok(())
+}
+
+pub fn interrupt_server(store: &ConfigStore, server: &ServerConfig) -> Result<()> {
+    fs::create_dir_all(server_runtime_dir(store, server))?;
+    fs::write(stop_flag_path(store, server), b"stop")?;
+    append_terminal_input(store, server, "\u{3}")?;
     Ok(())
 }
 
