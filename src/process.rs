@@ -16,6 +16,9 @@ use anyhow::{anyhow, Context, Result};
 use crate::config::{ConfigStore, ServerConfig};
 
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const STOP_TIMEOUT: Duration = Duration::from_secs(30);
+const CTRL_C_FALLBACK_DELAY: Duration = Duration::from_secs(10);
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -78,11 +81,16 @@ pub fn stop_server(store: &ConfigStore, server: &ServerConfig) -> Result<()> {
     append_command(store, server, "stop")?;
 
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(30) {
+    let mut sent_interrupt = false;
+    while start.elapsed() < STOP_TIMEOUT {
         if runtime_status(store, server) != RuntimeStatus::Running {
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(500));
+        if !sent_interrupt && start.elapsed() >= CTRL_C_FALLBACK_DELAY {
+            let _ = append_terminal_input(store, server, "\u{3}");
+            sent_interrupt = true;
+        }
+        thread::sleep(STOP_POLL_INTERVAL);
     }
 
     if let Some(pid) = read_pid(&child_pid_path(store, server))? {
@@ -510,6 +518,8 @@ fn pid_alive(pid: u32) -> bool {
     Command::new("kill")
         .arg("-0")
         .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
@@ -522,6 +532,8 @@ fn pid_alive(pid: u32) -> bool {
             "/C",
             &format!("tasklist /FI \"PID eq {pid}\" | findstr {pid}"),
         ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
@@ -532,6 +544,8 @@ fn kill_pid(pid: u32) -> Result<()> {
     let _ = Command::new("kill")
         .arg("-TERM")
         .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()?;
     Ok(())
 }
@@ -540,6 +554,8 @@ fn kill_pid(pid: u32) -> Result<()> {
 fn kill_pid(pid: u32) -> Result<()> {
     let _ = Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()?;
     Ok(())
 }
