@@ -84,7 +84,7 @@ fn draw_manager_workspace(frame: &mut Frame, app: &App, area: Rect) {
             ])
             .split(area);
         draw_server_list(frame, app, body[0]);
-        draw_detail(frame, app, body[1]);
+        draw_detail_workspace(frame, app, body[1]);
         draw_quick_panel(frame, app, body[2]);
     } else if area.width >= 72 {
         let body = Layout::default()
@@ -92,7 +92,7 @@ fn draw_manager_workspace(frame: &mut Frame, app: &App, area: Rect) {
             .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
             .split(area);
         draw_server_list(frame, app, body[0]);
-        draw_detail(frame, app, body[1]);
+        draw_detail_workspace(frame, app, body[1]);
     } else {
         let list_height = if area.height >= 16 {
             (area.height / 3).clamp(4, 10)
@@ -104,8 +104,25 @@ fn draw_manager_workspace(frame: &mut Frame, app: &App, area: Rect) {
             .constraints([Constraint::Length(list_height), Constraint::Min(1)])
             .split(area);
         draw_server_list(frame, app, body[0]);
-        draw_detail(frame, app, body[1]);
+        draw_detail_workspace(frame, app, body[1]);
     }
+}
+
+fn draw_detail_workspace(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height < 10 {
+        draw_detail(frame, app, area);
+        return;
+    }
+
+    let detail_height = detail_panel_height(app, area.width)
+        .max(4)
+        .min(area.height.saturating_sub(5));
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(detail_height)])
+        .split(area);
+    draw_server_log(frame, app, chunks[0]);
+    draw_detail(frame, app, chunks[1]);
 }
 
 fn draw_console_workspace(frame: &mut Frame, app: &App, area: Rect) {
@@ -313,7 +330,28 @@ fn draw_server_list(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
-    let text = if let Some(server) = app.selected() {
+    let paragraph = Paragraph::new(detail_lines(app))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(app.t(Text::Details)),
+        )
+        .scroll((app.detail_scroll, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
+fn detail_panel_height(app: &App, width: u16) -> u16 {
+    let inner_width = width.saturating_sub(2).max(1) as usize;
+    let content_height = detail_lines(app)
+        .iter()
+        .map(|line| line.width().div_ceil(inner_width).max(1) as u16)
+        .sum::<u16>();
+    content_height.saturating_add(2)
+}
+
+fn detail_lines(app: &App) -> Vec<Line<'static>> {
+    if let Some(server) = app.selected() {
         vec![
             Line::from(vec![
                 Span::styled(
@@ -364,16 +402,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
                 app.t(Text::ServerArgs),
                 server.server_args.join(" ")
             )),
-            Line::from(""),
-            Line::from(format!("{}:", app.t(Text::RecentVersions))),
         ]
-        .into_iter()
-        .chain(
-            app.versions
-                .iter()
-                .map(|line| Line::from(format!("  {line}"))),
-        )
-        .collect()
     } else if let Some(group_id) = app.selected_group_id() {
         let name = app
             .config
@@ -425,16 +454,36 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
             Line::from(app.t(Text::AddServerHint)),
             Line::from(app.t(Text::CustomJarHint)),
         ]
-    };
+    }
+}
 
-    let paragraph = Paragraph::new(text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(app.t(Text::Details)),
-        )
-        .scroll((app.detail_scroll, 0))
-        .wrap(Wrap { trim: false });
+fn draw_server_log(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let bordered = area.height >= 3 && area.width >= 4;
+    let height = if bordered {
+        area.height.saturating_sub(2).max(1) as usize
+    } else {
+        area.height.max(1) as usize
+    };
+    let width = if bordered {
+        area.width.saturating_sub(2).max(1) as usize
+    } else {
+        area.width.max(1) as usize
+    };
+    let lines = app.console_visible_lines(height, width);
+    let paragraph = if bordered {
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(app.t(Text::ServerLog)),
+            )
+            .wrap(Wrap { trim: false })
+    } else {
+        Paragraph::new(lines).wrap(Wrap { trim: false })
+    };
     frame.render_widget(paragraph, area);
 }
 
@@ -538,7 +587,6 @@ fn shortcut_lines(app: &App) -> Vec<Line<'static>> {
             Line::from("g  server args"),
             Line::from("p  directory"),
             Line::from("j  jar path"),
-            Line::from("v  versions"),
             Line::from("l  language"),
             Line::from("d  delete item"),
             Line::from("q  quit UI"),
@@ -567,7 +615,6 @@ fn shortcut_lines(app: &App) -> Vec<Line<'static>> {
             Line::from("g  服务端参数"),
             Line::from("p  服务器目录"),
             Line::from("j  Jar 路径"),
-            Line::from("v  版本列表"),
             Line::from("l  语言"),
             Line::from("d  删除项目"),
             Line::from("q  退出界面"),

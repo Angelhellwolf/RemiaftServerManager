@@ -75,7 +75,6 @@ e edit Java args
 g edit Minecraft server args
 p edit server directory
 j edit jar path
-v fetch recent Mojang versions
 d delete selected server/group
 q quit
 ```

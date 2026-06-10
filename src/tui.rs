@@ -10,7 +10,7 @@ use ratatui::text::Line;
 
 use crate::config::{ConfigStore, RemiaftConfig, ServerConfig};
 use crate::i18n::{self, Language, Text};
-use crate::{manifest, process};
+use crate::process;
 
 mod console_log;
 mod input;
@@ -118,7 +118,6 @@ struct App {
     input_cursor: usize,
     draft: Draft,
     status: String,
-    versions: Vec<String>,
     main_view: MainView,
     show_details: bool,
     detail_scroll: u16,
@@ -158,7 +157,6 @@ impl App {
                 startup_command: "java -Xms1024M -Xmx4096M -jar server.jar nogui".to_string(),
             },
             status: i18n::text(language, Text::Help).to_string(),
-            versions: Vec::new(),
             main_view: MainView::Details,
             show_details: true,
             detail_scroll: 0,
@@ -257,7 +255,6 @@ impl App {
             KeyCode::End => self.follow_console(),
             KeyCode::PageUp => self.scroll_console_page(-1),
             KeyCode::PageDown => self.scroll_console_page(1),
-            KeyCode::Char('v') => self.fetch_versions().await,
             KeyCode::Char('l') => {
                 self.mode = Mode::LanguageSelect;
                 self.status = i18n::text(self.language, Text::LanguagePromptHint).to_string();
@@ -1088,9 +1085,6 @@ impl App {
     }
 
     fn refresh_console(&mut self) {
-        if self.main_view != MainView::Console {
-            return;
-        }
         let Some(server) = self.selected().cloned() else {
             self.console_lines.clear();
             return;
@@ -1139,31 +1133,6 @@ impl App {
 
     fn console_cursor_position(&self) -> Option<(u16, u16)> {
         None
-    }
-
-    async fn fetch_versions(&mut self) {
-        self.status = self.t(Text::FetchingVersions).to_string();
-        match manifest::fetch_versions(12).await {
-            Ok(versions) => {
-                let server_label = self.t(Text::Server).to_string();
-                let client_only_label = self.t(Text::ClientOnly).to_string();
-                self.versions = versions
-                    .into_iter()
-                    .map(|version| {
-                        let server = if version.server_url.is_some() {
-                            server_label.as_str()
-                        } else {
-                            client_only_label.as_str()
-                        };
-                        format!("{} ({}, {})", version.id, version.kind, server)
-                    })
-                    .collect();
-                self.status = self.t(Text::VersionsUpdated).to_string();
-            }
-            Err(err) => {
-                self.status = format!("{}: {err}", self.t(Text::VersionFetchFailed));
-            }
-        }
     }
 
     fn set_language(&mut self, language: Language) -> Result<()> {
