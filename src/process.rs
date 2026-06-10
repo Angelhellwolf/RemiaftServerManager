@@ -509,10 +509,6 @@ fn launch_command(default_java: &str, server: &ServerConfig) -> Command {
     }
 }
 
-fn sanitize_terminal_input(input: &str) -> String {
-    String::from_utf8_lossy(&sanitize_terminal_bytes(input.as_bytes())).into_owned()
-}
-
 fn sanitize_terminal_bytes(input: &[u8]) -> Vec<u8> {
     let mut output = Vec::with_capacity(input.len());
     let mut index = 0;
@@ -926,15 +922,19 @@ fn kill_pid(pid: u32) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn sanitize_text(input: &str) -> String {
+        String::from_utf8_lossy(&sanitize_terminal_bytes(input.as_bytes())).into_owned()
+    }
+
     #[test]
     fn terminal_input_normalizes_backspace_to_delete() {
-        assert_eq!(sanitize_terminal_input("sa\u{8}y\r"), "sa\u{7f}y\r");
+        assert_eq!(sanitize_text("sa\u{8}y\r"), "sa\u{7f}y\r");
     }
 
     #[test]
     fn terminal_input_keeps_known_editing_keys() {
         assert_eq!(
-            sanitize_terminal_input(
+            sanitize_text(
                 "\u{1b}[A\u{1b}[B\u{1b}[C\u{1b}[D\u{1b}[H\u{1b}[F\u{1b}[3~\u{1}\u{5}\u{15}\t"
             ),
             "\u{1b}[A\u{1b}[B\u{1b}[C\u{1b}[D\u{1b}[H\u{1b}[F\u{1b}[3~\u{1}\u{5}\u{15}\t"
@@ -944,7 +944,7 @@ mod tests {
     #[test]
     fn terminal_input_drops_mouse_and_osc_sequences() {
         assert_eq!(
-            sanitize_terminal_input("say hi\u{1b}[<64;12;9M\u{1b}]0;title\u{7}\r"),
+            sanitize_text("say hi\u{1b}[<64;12;9M\u{1b}]0;title\u{7}\r"),
             "say hi\r"
         );
     }
@@ -952,7 +952,7 @@ mod tests {
     #[test]
     fn terminal_input_drops_disallowed_command_text() {
         assert_eq!(
-            sanitize_terminal_input("say \u{a7}red\u{1b}bad\u{7f}\r"),
+            sanitize_text("say \u{a7}red\u{1b}bad\u{7f}\r"),
             "say redad\u{7f}\r"
         );
     }
