@@ -5,13 +5,20 @@ mod process;
 mod tui;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 
 use crate::config::ConfigStore;
 
 #[derive(Debug, Parser)]
-#[command(name = "remiaft", version, about = "Minecraft server manager")]
+#[command(
+    name = "remiaft",
+    version,
+    about = "Minecraft server manager",
+    disable_version_flag = true
+)]
 struct Cli {
+    #[arg(short = 'v', long = "version", action = ArgAction::Version, help = "Print version")]
+    version: Option<bool>,
     #[command(subcommand)]
     command: Option<Commands>,
 }

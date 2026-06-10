@@ -8,7 +8,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent,
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 
-use crate::config::{ConfigStore, RemiaftConfig};
+use crate::config::{ConfigStore, RemiaftConfig, ServerConfig};
 use crate::i18n::{self, Language, Text};
 use crate::{manifest, process};
 
@@ -48,6 +48,16 @@ pub async fn run(store: ConfigStore) -> Result<()> {
                 Event::Mouse(mouse) => app.handle_mouse(mouse),
                 Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
             }
+        }
+        if let Some(server) = app.take_console_attach_request() {
+            terminal.suspend()?;
+            let attach_result = process::attach_terminal(&app.store, &server);
+            terminal.resume()?;
+            app.queue_screen_clear();
+            app.status = match attach_result {
+                Ok(()) => app.t(Text::Help).to_string(),
+                Err(err) => format!("console attach failed: {err}"),
+            };
         }
     }
 
@@ -117,6 +127,7 @@ struct App {
     console_end: Option<usize>,
     console_follow: bool,
     console_wrap_width: usize,
+    console_attach_request: Option<ServerConfig>,
     needs_screen_clear: bool,
 }
 
@@ -156,6 +167,7 @@ impl App {
             console_end: None,
             console_follow: true,
             console_wrap_width: 120,
+            console_attach_request: None,
             needs_screen_clear: false,
         })
     }
@@ -260,37 +272,14 @@ impl App {
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.leave_console();
             }
-            KeyCode::Esc => {
-                self.leave_console();
-            }
-            KeyCode::Enter => self.send_console_terminal_input("\r").map(|_| ())?,
-            KeyCode::Left => self.send_console_terminal_input("\u{1b}[D").map(|_| ())?,
-            KeyCode::Right => self.send_console_terminal_input("\u{1b}[C").map(|_| ())?,
-            KeyCode::Up => self.send_console_terminal_input("\u{1b}[A").map(|_| ())?,
-            KeyCode::Down => self.send_console_terminal_input("\u{1b}[B").map(|_| ())?,
-            KeyCode::Home => self.send_console_terminal_input("\u{1b}[H").map(|_| ())?,
-            KeyCode::End => self.send_console_terminal_input("\u{1b}[F").map(|_| ())?,
-            KeyCode::Delete => self.send_console_terminal_input("\u{1b}[3~").map(|_| ())?,
-            KeyCode::Backspace | KeyCode::Char('h')
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    || key.code == KeyCode::Backspace =>
-            {
-                self.send_console_terminal_input("\u{7f}")?;
-            }
             KeyCode::PageUp => self.scroll_console_page(-1),
             KeyCode::PageDown => self.scroll_console_page(1),
-            KeyCode::Tab => self.send_console_terminal_input("\t").map(|_| ())?,
-            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.toggle_details()
+            _ => {
+                if let Some(input) = self.console_key_input(key) {
+                    self.send_console_terminal_input(&input)?;
+                    self.follow_console();
+                }
             }
-            KeyCode::Char(ch)
-                if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
-                    && process::is_allowed_console_char(ch) =>
-            {
-                let mut encoded = [0; 4];
-                self.send_console_terminal_input(ch.encode_utf8(&mut encoded))?;
-            }
-            _ => {}
         }
         Ok(false)
     }
@@ -921,20 +910,6 @@ impl App {
         }
     }
 
-    fn send_console_terminal_input(&self, input: &str) -> Result<bool> {
-        let Some(server) = self
-            .selected()
-            .filter(|server| {
-                process::runtime_status(&self.store, server) == process::RuntimeStatus::Running
-            })
-            .cloned()
-        else {
-            return Ok(false);
-        };
-        process::append_terminal_input(&self.store, &server, input)?;
-        Ok(true)
-    }
-
     fn interrupt_console_server(&mut self) -> Result<()> {
         let Some(server) = self.selected().cloned() else {
             return Ok(());
@@ -952,6 +927,58 @@ impl App {
         Ok(())
     }
 
+    fn send_console_terminal_input(&self, input: &str) -> Result<bool> {
+        let Some(server) = self
+            .selected()
+            .filter(|server| {
+                process::runtime_status(&self.store, server) == process::RuntimeStatus::Running
+            })
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        process::append_terminal_input(&self.store, &server, input)?;
+        Ok(true)
+    }
+
+    fn console_key_input(&self, key: KeyEvent) -> Option<String> {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Backspace => Some("\u{7f}".to_string()),
+            KeyCode::Enter => Some("\r".to_string()),
+            KeyCode::Left => Some(self.cursor_key_input('D')),
+            KeyCode::Right => Some(self.cursor_key_input('C')),
+            KeyCode::Up => Some(self.cursor_key_input('A')),
+            KeyCode::Down => Some(self.cursor_key_input('B')),
+            KeyCode::Home => Some("\u{1b}[H".to_string()),
+            KeyCode::End => Some("\u{1b}[F".to_string()),
+            KeyCode::Delete => Some("\u{1b}[3~".to_string()),
+            KeyCode::Insert => Some("\u{1b}[2~".to_string()),
+            KeyCode::Tab => Some("\t".to_string()),
+            KeyCode::BackTab => Some("\u{1b}[Z".to_string()),
+            KeyCode::Esc => Some("\u{1b}".to_string()),
+            KeyCode::Char(ch) if control => control_char_input(ch),
+            KeyCode::Char(ch)
+                if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT || alt)
+                    && process::is_allowed_console_char(ch) =>
+            {
+                let mut encoded = [0; 4];
+                let input = ch.encode_utf8(&mut encoded);
+                if alt {
+                    Some(format!("\u{1b}{input}"))
+                } else {
+                    Some(input.to_string())
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn cursor_key_input(&self, suffix: char) -> String {
+        format!("\u{1b}[{suffix}")
+    }
+
     fn queue_screen_clear(&mut self) {
         self.needs_screen_clear = true;
     }
@@ -961,18 +988,25 @@ impl App {
     }
 
     fn toggle_console(&mut self) {
-        match self.main_view {
-            MainView::Details => {
-                if self.selected().is_some() {
-                    self.main_view = MainView::Console;
-                    self.reset_console_for_selection();
-                    self.status = self.t(Text::ConsoleFollow).to_string();
-                }
-            }
-            MainView::Console => {
-                self.leave_console();
-            }
+        self.request_console_attach();
+    }
+
+    fn request_console_attach(&mut self) {
+        let Some(server) = self.selected().cloned() else {
+            return;
+        };
+        if process::runtime_status(&self.store, &server) != process::RuntimeStatus::Running {
+            self.status = match self.language {
+                Language::English => format!("{} is not running", server.name),
+                Language::ChineseSimplified => format!("{} 未运行", server.name),
+            };
+            return;
         }
+        self.console_attach_request = Some(server);
+    }
+
+    fn take_console_attach_request(&mut self) -> Option<ServerConfig> {
+        self.console_attach_request.take()
     }
 
     fn leave_console(&mut self) {
@@ -1103,6 +1137,10 @@ impl App {
             .collect()
     }
 
+    fn console_cursor_position(&self) -> Option<(u16, u16)> {
+        None
+    }
+
     async fn fetch_versions(&mut self) {
         self.status = self.t(Text::FetchingVersions).to_string();
         match manifest::fetch_versions(12).await {
@@ -1183,15 +1221,7 @@ impl App {
         } else {
             0
         };
-        let console_height = body_height.saturating_sub(console_header_height);
-        let input_height = if console_height >= 6 {
-            3
-        } else if console_height >= 3 {
-            1
-        } else {
-            0
-        };
-        let log_height = console_height.saturating_sub(input_height);
+        let log_height = body_height.saturating_sub(console_header_height);
         let bordered = log_height >= 3 && area.width >= 4;
         let width = if bordered {
             area.width.saturating_sub(2).max(1)
@@ -1207,5 +1237,22 @@ impl App {
 
     fn save(&self) -> Result<()> {
         self.store.save(&self.config)
+    }
+}
+
+fn control_char_input(ch: char) -> Option<String> {
+    let lower = ch.to_ascii_lowercase();
+    if lower.is_ascii_lowercase() {
+        let code = lower as u8 - b'a' + 1;
+        return Some((code as char).to_string());
+    }
+    match ch {
+        '[' => Some("\u{1b}".to_string()),
+        '\\' => Some("\u{1c}".to_string()),
+        ']' => Some("\u{1d}".to_string()),
+        '^' => Some("\u{1e}".to_string()),
+        '_' => Some("\u{1f}".to_string()),
+        '?' => Some("\u{7f}".to_string()),
+        _ => None,
     }
 }

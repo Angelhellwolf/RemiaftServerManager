@@ -476,6 +476,16 @@ fn draw_console_log(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(lines).wrap(Wrap { trim: false })
     };
     frame.render_widget(paragraph, area);
+    if let Some((row, col)) = app.console_cursor_position() {
+        let x_offset = if bordered { 1 } else { 0 };
+        let y_offset = if bordered { 1 } else { 0 };
+        let cursor_x = area.x.saturating_add(x_offset).saturating_add(col);
+        let cursor_y = area.y.saturating_add(y_offset).saturating_add(row);
+        frame.set_cursor_position(Position::new(
+            cursor_x.min(area.right().saturating_sub(1)),
+            cursor_y.min(area.bottom().saturating_sub(1)),
+        ));
+    }
 }
 
 fn draw_quick_panel(frame: &mut Frame, app: &App, area: Rect) {
@@ -513,10 +523,10 @@ fn shortcut_lines(app: &App) -> Vec<Line<'static>> {
             Line::from("F5  start selected/group"),
             Line::from("F6  stop selected/group"),
             Line::from("F7  restart selected/group"),
-            Line::from("o  console/details"),
+            Line::from("o  attach console"),
             Line::from("i  send command"),
             Line::from("b  side panel"),
-            Line::from("PgUp/PgDn  scroll console"),
+            Line::from("Ctrl-U  detach console"),
             Line::from("s  start current"),
             Line::from("x  stop current"),
             Line::from("r  restart current"),
@@ -542,10 +552,10 @@ fn shortcut_lines(app: &App) -> Vec<Line<'static>> {
             Line::from("F5  启动所选/分组"),
             Line::from("F6  停止所选/分组"),
             Line::from("F7  重启所选/分组"),
-            Line::from("o  控制台/详情"),
+            Line::from("o  原生控制台"),
             Line::from("i  发送命令"),
             Line::from("b  侧栏面板"),
-            Line::from("PgUp/PgDn  滚动控制台"),
+            Line::from("Ctrl-U  脱离控制台"),
             Line::from("s  启动当前"),
             Line::from("x  停止当前"),
             Line::from("r  重启当前"),

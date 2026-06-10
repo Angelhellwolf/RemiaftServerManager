@@ -115,7 +115,7 @@ pub fn text(language: Language, key: Text) -> &'static str {
 
 fn english(key: Text) -> &'static str {
     match key {
-        Text::Help => "Enter select | F5/F6/F7 batch | F2 group | F3 move | o console",
+        Text::Help => "Enter select | F5/F6/F7 batch | F2 group | F3 move | o attach console",
         Text::LanguageSaved => "language saved",
         Text::LanguagePromptTitle => "Language",
         Text::LanguagePromptBody => "Choose the interface language before using remiaft.",
@@ -131,7 +131,7 @@ fn english(key: Text) -> &'static str {
         Text::ManagerExitHint => "q exits the UI. Ctrl-C exits outside the console.",
         Text::Console => "Console",
         Text::ConsoleHint => {
-            "o console | type directly | Tab native complete | Ctrl-C interrupt | Ctrl-U detach | PgUp/PgDn scroll"
+            "o attach native console | Tab/arrows go to server | Ctrl-C interrupt | Ctrl-U detach"
         }
         Text::ConsoleFollow => "following live output",
         Text::ConsolePaused => "manual scroll; new output will not move the view",
@@ -198,7 +198,7 @@ fn english(key: Text) -> &'static str {
 
 fn chinese_simplified(key: Text) -> &'static str {
     match key {
-        Text::Help => "Enter 多选 | F5/F6/F7 批量 | F2 分组 | F3 移动 | o 控制台",
+        Text::Help => "Enter 多选 | F5/F6/F7 批量 | F2 分组 | F3 移动 | o 原生控制台",
         Text::LanguageSaved => "语言已保存",
         Text::LanguagePromptTitle => "语言 / Language",
         Text::LanguagePromptBody => "请选择 remiaft 管理界面语言。",
@@ -213,9 +213,7 @@ fn chinese_simplified(key: Text) -> &'static str {
         Text::NoServerSelected => "未选择服务器",
         Text::ManagerExitHint => "q 退出界面；Ctrl-C 在非控制台界面退出。",
         Text::Console => "控制台",
-        Text::ConsoleHint => {
-            "o 控制台 | 直接输入 | Tab 原生补全 | Ctrl-C 中断 | Ctrl-U 脱离 | PgUp/PgDn 滚动"
-        }
+        Text::ConsoleHint => "o 原生控制台 | Tab/方向键进服务端 | Ctrl-C 中断 | Ctrl-U 脱离",
         Text::ConsoleFollow => "正在跟随实时输出",
         Text::ConsolePaused => "手动滚动中，新输出不会移动视图",
         Text::ConsoleEmpty => "暂无控制台输出。",

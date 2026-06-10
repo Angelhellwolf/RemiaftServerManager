@@ -59,15 +59,12 @@ Inside the TUI:
 
 ```text
 u edit the startup command, for example: java -Xms1G -Xmx4G -jar server.jar nogui
-o open/close live console for the selected server
-type directly in the console; input is forwarded to the running server PTY
-Tab in the live console is forwarded to the running server terminal, so servers
-use their native Minecraft/Paper completion path
-Ctrl-C in the live console sends an interrupt to the selected server
-Ctrl-U detach from the console view without stopping the server
+o attach a native console for the selected running server
+type directly in the native console; Tab, arrows, and editing keys go to the server
+Ctrl-C in the native console sends an interrupt to the selected server
+Ctrl-U detaches from the native console without stopping the server
 b show/hide the right side panel
-Up/Down are forwarded to the server terminal, usually for command history
-PageUp/PageDown scroll console output
+use your terminal scrollback for attached console history
 n add server
 s start selected server
 x stop selected server
@@ -91,11 +88,13 @@ args, then keeps managing it without requiring `screen`.
 
 The CLI is not the long-running runtime. Starting a server launches a per-server
 background `remiaft supervise <id>` process. On Unix this supervisor starts the
-server inside a PTY, so Minecraft/Velocity sees a real terminal, ANSI colors are
-preserved in the console log, and commands typed in the TUI are written back to
-the server terminal. Closing the TUI, pressing Ctrl-C in the manager, or pressing
-Ctrl-U to detach from the console view only exits the management interface. The
-Minecraft process keeps running.
+server inside a PTY, so Minecraft/Velocity sees a real terminal and ANSI colors
+are preserved in the console log. Pressing `o` temporarily leaves the TUI
+alternate screen and attaches the current terminal to the server stream: input
+bytes are forwarded to the server, and raw PTY output is written back to your
+terminal for native JLine/Paper/Velocity completion behavior. Closing the TUI,
+pressing Ctrl-C in the manager, or pressing Ctrl-U to detach from the native
+console only exits the management interface. The Minecraft process keeps running.
 
 The supervisor owns the Minecraft child process, writes raw terminal logs,
 forwards queued console commands, and restarts the server when `auto_restart` is

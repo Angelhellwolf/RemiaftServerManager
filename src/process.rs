@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 #[cfg(unix)]
@@ -12,6 +12,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use crossterm::cursor;
+use crossterm::execute;
+use crossterm::terminal::{self, disable_raw_mode, enable_raw_mode};
 
 use crate::config::{ConfigStore, ServerConfig};
 
@@ -130,6 +133,133 @@ pub fn append_terminal_input(
     Ok(())
 }
 
+pub fn request_terminal_resize(
+    store: &ConfigStore,
+    server: &ServerConfig,
+    rows: u16,
+    cols: u16,
+) -> Result<()> {
+    fs::create_dir_all(server_runtime_dir(store, server))?;
+    fs::write(resize_path(store, server), format!("{rows} {cols}\n"))?;
+    Ok(())
+}
+
+pub fn attach_terminal(store: &ConfigStore, server: &ServerConfig) -> Result<()> {
+    if runtime_status(store, server) != RuntimeStatus::Running {
+        return Err(anyhow!("{} is not running", server.name));
+    }
+    fs::create_dir_all(server_runtime_dir(store, server))?;
+    let _raw = AttachTerminalGuard::enter()?;
+    let (cols, rows) = terminal::size().unwrap_or((120, 40));
+    let _ = request_terminal_resize(store, server, rows, cols);
+
+    let log_path = minecraft_log_path(store, server);
+    let offset = fs::metadata(&log_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let done = Arc::new(AtomicBool::new(false));
+    let output_done = Arc::clone(&done);
+    let output_thread = thread::spawn(move || tail_terminal_output(log_path, offset, output_done));
+
+    let mut stdout = io::stdout();
+    write!(
+        stdout,
+        "\r\n-- remiaft native console: {} --\r\nCtrl-U detach | Ctrl-C interrupt server | terminal scrollback for history\r\n\r\n",
+        server.name
+    )?;
+    stdout.flush()?;
+
+    let mut stdin = io::stdin().lock();
+    let mut buf = [0_u8; 1024];
+    loop {
+        let read = stdin.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        let (cols, rows) = terminal::size().unwrap_or((cols, rows));
+        let _ = request_terminal_resize(store, server, rows, cols);
+
+        let mut chunk_start = 0;
+        for index in 0..read {
+            match buf[index] {
+                0x15 => {
+                    append_terminal_bytes(store, server, &buf[chunk_start..index])?;
+                    done.store(true, Ordering::Relaxed);
+                    let _ = output_thread.join();
+                    stdout.write_all(b"\r\n-- detached --\r\n")?;
+                    stdout.flush()?;
+                    return Ok(());
+                }
+                0x03 => {
+                    append_terminal_bytes(store, server, &buf[chunk_start..index])?;
+                    interrupt_server(store, server)?;
+                    chunk_start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        append_terminal_bytes(store, server, &buf[chunk_start..read])?;
+    }
+
+    done.store(true, Ordering::Relaxed);
+    let _ = output_thread.join();
+    Ok(())
+}
+
+fn append_terminal_bytes(store: &ConfigStore, server: &ServerConfig, bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let input = String::from_utf8_lossy(bytes);
+    append_terminal_input(store, server, &input)
+}
+
+fn tail_terminal_output(path: PathBuf, mut offset: u64, done: Arc<AtomicBool>) {
+    let mut stdout = io::stdout();
+    let mut buf = [0_u8; 8192];
+    while !done.load(Ordering::Relaxed) {
+        if let Ok(mut file) = File::open(&path) {
+            if let Ok(len) = file.metadata().map(|metadata| metadata.len()) {
+                if len < offset {
+                    offset = 0;
+                }
+            }
+            if file.seek(SeekFrom::Start(offset)).is_ok() {
+                loop {
+                    match file.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            offset = offset.saturating_add(n as u64);
+                            let _ = stdout.write_all(&buf[..n]);
+                            let _ = stdout.flush();
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+struct AttachTerminalGuard;
+
+impl AttachTerminalGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, cursor::Show)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for AttachTerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), cursor::Show);
+    }
+}
+
 pub fn minecraft_log_path_for(store: &ConfigStore, server: &ServerConfig) -> PathBuf {
     minecraft_log_path(store, server)
 }
@@ -216,15 +346,18 @@ fn run_server_once(
     let done = Arc::new(AtomicBool::new(false));
     let command_done = Arc::clone(&done);
     let command_file = command_path(store, server);
+    let resize_file = resize_path(store, server);
     let mut master_writer = master.try_clone()?;
     let command_thread = thread::spawn(move || {
         let mut offset = 0;
+        let mut size = None;
         while !command_done.load(Ordering::Relaxed) {
             if let Ok(new_offset) =
                 pump_terminal_commands(&command_file, offset, &mut master_writer)
             {
                 offset = new_offset;
             }
+            let _ = pump_terminal_resize(&resize_file, &master_writer, &mut size);
             thread::sleep(COMMAND_POLL_INTERVAL);
         }
     });
@@ -346,12 +479,12 @@ fn sanitize_terminal_input(input: &str) -> String {
         match ch {
             '\u{1b}' => {
                 if let Some(sequence) = read_allowed_input_escape(&mut chars) {
-                    output.push_str(sequence);
+                    output.push_str(&sequence);
                 }
             }
             '\u{8}' => output.push('\u{7f}'),
-            '\r' | '\n' | '\t' | '\u{1}' | '\u{3}' | '\u{5}' | '\u{15}' | '\u{7f}' => {
-                output.push(ch);
+            '\r' | '\n' | '\t' | '\u{1}'..='\u{1a}' | '\u{1c}'..='\u{1f}' | '\u{7f}' => {
+                output.push(ch)
             }
             _ if is_allowed_console_char(ch) => output.push(ch),
             _ => {}
@@ -365,7 +498,7 @@ pub fn is_allowed_console_char(ch: char) -> bool {
     ch >= ' ' && ch != '\u{7f}' && ch != '\u{a7}' && !ch.is_control()
 }
 
-fn read_allowed_input_escape<I>(chars: &mut std::iter::Peekable<I>) -> Option<&'static str>
+fn read_allowed_input_escape<I>(chars: &mut std::iter::Peekable<I>) -> Option<String>
 where
     I: Iterator<Item = char>,
 {
@@ -375,21 +508,19 @@ where
             let mut sequence = String::from("\u{1b}[");
             for ch in chars.by_ref() {
                 sequence.push(ch);
+                if sequence.len() > 32 {
+                    return None;
+                }
                 if ('@'..='~').contains(&ch) {
                     break;
                 }
             }
 
-            match sequence.as_str() {
-                "\u{1b}[A" => Some("\u{1b}[A"),
-                "\u{1b}[B" => Some("\u{1b}[B"),
-                "\u{1b}[C" => Some("\u{1b}[C"),
-                "\u{1b}[D" => Some("\u{1b}[D"),
-                "\u{1b}[F" => Some("\u{1b}[F"),
-                "\u{1b}[H" => Some("\u{1b}[H"),
-                "\u{1b}[3~" => Some("\u{1b}[3~"),
-                _ => None,
-            }
+            is_allowed_csi_input(&sequence).then_some(sequence)
+        }
+        'O' => {
+            let ch = chars.next()?;
+            matches!(ch, 'A'..='D' | 'F' | 'H' | 'P'..='S').then(|| format!("\u{1b}O{ch}"))
         }
         ']' => {
             while let Some(ch) = chars.next() {
@@ -409,6 +540,25 @@ where
         }
         _ => None,
     }
+}
+
+fn is_allowed_csi_input(sequence: &str) -> bool {
+    let Some(body) = sequence.strip_prefix("\u{1b}[") else {
+        return false;
+    };
+    let Some(final_char) = body.chars().last() else {
+        return false;
+    };
+    if !('@'..='~').contains(&final_char) {
+        return false;
+    }
+    let prefix_len = body.len().saturating_sub(final_char.len_utf8());
+    if matches!(final_char, 'M' | 'm') && body.starts_with('<') {
+        return false;
+    }
+    body[..prefix_len]
+        .chars()
+        .all(|ch| ch.is_ascii_digit() || matches!(ch, ';' | '?' | '>' | '<' | ':' | ' '))
 }
 
 #[cfg(unix)]
@@ -456,6 +606,32 @@ fn pump_terminal_commands(path: &Path, offset: u64, terminal: &mut impl Write) -
         terminal.flush()?;
     }
     Ok(offset + buf.len() as u64)
+}
+
+#[cfg(unix)]
+fn pump_terminal_resize(
+    path: &Path,
+    terminal: &File,
+    last_size: &mut Option<(u16, u16)>,
+) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let raw = fs::read_to_string(path)?;
+    let mut parts = raw.split_whitespace();
+    let Some(rows) = parts.next().and_then(|value| value.parse::<u16>().ok()) else {
+        return Ok(());
+    };
+    let Some(cols) = parts.next().and_then(|value| value.parse::<u16>().ok()) else {
+        return Ok(());
+    };
+    let size = (rows.max(1), cols.max(1));
+    if *last_size == Some(size) {
+        return Ok(());
+    }
+    set_pty_size(terminal.as_raw_fd(), size.0, size.1)?;
+    *last_size = Some(size);
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -512,7 +688,21 @@ fn configure_pty_slave(slave_fd: i32) -> Result<()> {
     }
     termios.c_cc[libc::VERASE] = 0x7f;
     if unsafe { libc::tcsetattr(slave_fd, libc::TCSANOW, &termios) } == -1 {
-        return Err(std::io::Error::last_os_error()).context("set pty erase character");
+        return Err(std::io::Error::last_os_error()).context("configure pty terminal flags");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_pty_size(fd: i32, rows: u16, cols: u16) -> Result<()> {
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ as libc::c_ulong, &size) } == -1 {
+        return Err(std::io::Error::last_os_error()).context("resize pty");
     }
     Ok(())
 }
@@ -535,6 +725,7 @@ fn cleanup_runtime(store: &ConfigStore, server: &ServerConfig) {
     let _ = fs::remove_file(supervisor_pid_path(store, server));
     let _ = fs::remove_file(child_pid_path(store, server));
     let _ = fs::remove_file(stop_flag_path(store, server));
+    let _ = fs::remove_file(resize_path(store, server));
 }
 
 fn append_supervisor_log(store: &ConfigStore, server: &ServerConfig, line: &str) -> Result<()> {
@@ -591,6 +782,10 @@ fn child_pid_path(store: &ConfigStore, server: &ServerConfig) -> PathBuf {
 
 fn command_path(store: &ConfigStore, server: &ServerConfig) -> PathBuf {
     server_runtime_dir(store, server).join("commands.in")
+}
+
+fn resize_path(store: &ConfigStore, server: &ServerConfig) -> PathBuf {
+    server_runtime_dir(store, server).join("terminal.size")
 }
 
 fn stop_flag_path(store: &ConfigStore, server: &ServerConfig) -> PathBuf {

@@ -1,4 +1,4 @@
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 
 use anyhow::Result;
 use crossterm::cursor;
@@ -41,6 +41,32 @@ impl TerminalGuard {
     pub(super) fn size(&self) -> Result<Rect> {
         let size = self.terminal.size()?;
         Ok(Rect::new(0, 0, size.width, size.height))
+    }
+
+    pub(super) fn suspend(&mut self) -> Result<()> {
+        self.terminal.show_cursor()?;
+        self.terminal.clear()?;
+        execute!(
+            self.terminal.backend_mut(),
+            TerminalClear(ClearType::All),
+            cursor::MoveTo(0, 0),
+            LeaveAlternateScreen
+        )?;
+        self.terminal.backend_mut().flush()?;
+        disable_raw_mode()?;
+        Ok(())
+    }
+
+    pub(super) fn resume(&mut self) -> Result<()> {
+        enable_raw_mode()?;
+        execute!(
+            self.terminal.backend_mut(),
+            EnterAlternateScreen,
+            TerminalClear(ClearType::All),
+            cursor::MoveTo(0, 0)
+        )?;
+        self.terminal.hide_cursor()?;
+        Ok(())
     }
 }
 
