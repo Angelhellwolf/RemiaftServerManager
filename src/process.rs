@@ -15,6 +15,8 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::config::{ConfigStore, ServerConfig};
 
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(unix)]
@@ -98,6 +100,20 @@ pub fn append_command(store: &ConfigStore, server: &ServerConfig, command: &str)
         .append(true)
         .open(command_path(store, server))?;
     writeln!(file, "{command}")?;
+    Ok(())
+}
+
+pub fn append_terminal_input(
+    store: &ConfigStore,
+    server: &ServerConfig,
+    input: &str,
+) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(command_path(store, server))?;
+    file.write_all(input.as_bytes())?;
+    file.flush()?;
     Ok(())
 }
 
@@ -195,7 +211,7 @@ fn run_server_once(
             {
                 offset = new_offset;
             }
-            thread::sleep(Duration::from_millis(300));
+            thread::sleep(COMMAND_POLL_INTERVAL);
         }
     });
 
@@ -270,7 +286,7 @@ fn run_server_once(
             if let Ok(new_offset) = pump_commands(&command_file, offset, &mut stdin) {
                 offset = new_offset;
             }
-            thread::sleep(Duration::from_millis(300));
+            thread::sleep(COMMAND_POLL_INTERVAL);
         }
     });
 

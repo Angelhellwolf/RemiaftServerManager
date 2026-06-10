@@ -61,6 +61,8 @@ Inside the TUI:
 u edit the startup command, for example: java -Xms1G -Xmx4G -jar server.jar nogui
 o open/close live console for the selected server
 type in the console and press Enter to send a command
+Tab in the live console is forwarded to the running server terminal, so Unix PTY
+servers use the same completion path as the vanilla Minecraft console
 Ctrl-U detach from the console view without stopping the server
 b show/hide the right side panel
 Up/Down scroll console output when console is open
@@ -126,3 +128,17 @@ https://piston-meta.mojang.com/mc/game/version_manifest_v2.json
 Custom server jars such as Paper, Fabric, Forge, and modpack launchers are also
 supported because each server entry points at an arbitrary jar path and argument
 list.
+
+## Project Design
+
+The runtime boundary is intentionally separate from the UI. `src/process.rs`
+owns supervisor processes, PID files, command queues, PTY handling, and server
+lifecycle. `src/tui.rs` owns TUI state and event dispatch, while `src/tui/`
+contains focused modules for rendering, input editing, startup command parsing,
+console log rendering, and terminal setup/cleanup.
+
+Near-term development should continue reducing `src/tui.rs`: move tree
+selection into `src/tui/tree.rs`, form submission into `src/tui/forms.rs`, and
+console scroll/input state into `src/tui/console.rs`. Runtime work should focus
+on incremental log reads, stronger supervisor tests, explicit config migrations,
+and CI coverage for `cargo fmt --check`, `cargo clippy`, and `cargo test`.
