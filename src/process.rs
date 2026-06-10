@@ -155,10 +155,9 @@ fn run_server_once(
     let stdout = slave.try_clone()?;
     let stderr = slave.try_clone()?;
 
-    let mut command = Command::new(server.java_bin(default_java));
+    let mut command = launch_command(default_java, server);
     command
         .current_dir(&server.directory)
-        .args(java_args(server))
         .env("TERM", "xterm-256color")
         .env("COLORTERM", "truecolor")
         .env("CLICOLOR_FORCE", "1")
@@ -180,7 +179,7 @@ fn run_server_once(
 
     let mut child = command
         .spawn()
-        .with_context(|| format!("spawn Minecraft server {}", server.name))?;
+        .with_context(|| format!("spawn server process {}", server.name))?;
     drop(slave);
 
     fs::write(child_pid_path(store, server), child.id().to_string())?;
@@ -249,14 +248,16 @@ fn run_server_once(
     let log = append_file(&minecraft_log_path(store, server))?;
     let stderr = log.try_clone()?;
 
-    let mut child = Command::new(server.java_bin(default_java))
+    let mut command = launch_command(default_java, server);
+    command
         .current_dir(&server.directory)
-        .args(java_args(server))
         .stdin(Stdio::piped())
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(stderr))
+        .stderr(Stdio::from(stderr));
+
+    let mut child = command
         .spawn()
-        .with_context(|| format!("spawn Minecraft server {}", server.name))?;
+        .with_context(|| format!("spawn server process {}", server.name))?;
 
     fs::write(child_pid_path(store, server), child.id().to_string())?;
     let done = Arc::new(AtomicBool::new(false));
@@ -290,6 +291,35 @@ fn java_args(server: &ServerConfig) -> Vec<String> {
     args.push(server.jar_path.to_string_lossy().to_string());
     args.extend(server.server_args.clone());
     args
+}
+
+fn launch_command(default_java: &str, server: &ServerConfig) -> Command {
+    if let Some(startup_command) = server
+        .startup_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+    {
+        shell_command(startup_command)
+    } else {
+        let mut command = Command::new(server.java_bin(default_java));
+        command.args(java_args(server));
+        command
+    }
+}
+
+#[cfg(unix)]
+fn shell_command(command_line: &str) -> Command {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(command_line);
+    command
+}
+
+#[cfg(windows)]
+fn shell_command(command_line: &str) -> Command {
+    let mut command = Command::new("cmd");
+    command.arg("/C").arg(command_line);
+    command
 }
 
 #[cfg(not(unix))]
@@ -329,20 +359,41 @@ fn pump_terminal_commands(path: &Path, offset: u64, terminal: &mut impl Write) -
 fn open_pty() -> Result<(File, i32)> {
     let mut master_fd = 0;
     let mut slave_fd = 0;
-    let mut size = libc::winsize {
-        ws_row: 40,
-        ws_col: 160,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
+    #[cfg(target_vendor = "apple")]
+    let rc = {
+        let mut size = libc::winsize {
+            ws_row: 40,
+            ws_col: 160,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut size,
+            )
+        }
     };
-    let rc = unsafe {
-        libc::openpty(
-            &mut master_fd,
-            &mut slave_fd,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            &mut size,
-        )
+    #[cfg(not(target_vendor = "apple"))]
+    let rc = {
+        let size = libc::winsize {
+            ws_row: 40,
+            ws_col: 160,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                ptr::null_mut(),
+                ptr::null(),
+                &size,
+            )
+        }
     };
     if rc == -1 {
         return Err(std::io::Error::last_os_error()).context("open pty");

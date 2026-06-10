@@ -174,6 +174,23 @@ impl RemiaftConfig {
                 server.java_args = server.java_args[java_arg_start..jar_index].to_vec();
                 server.startup_command = Some(server.startup_command(&self.java_path));
                 changed = true;
+                continue;
+            }
+
+            if let Some(startup_command) = server
+                .startup_command
+                .as_deref()
+                .map(str::trim)
+                .filter(|command| !command.is_empty())
+            {
+                let legacy_java_args = server.java_args.join(" ");
+                if !server.java_args.is_empty()
+                    && server.server_args.is_empty()
+                    && legacy_java_args == startup_command
+                {
+                    server.java_args.clear();
+                    changed = true;
+                }
             }
         }
         changed

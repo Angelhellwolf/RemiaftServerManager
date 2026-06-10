@@ -298,6 +298,7 @@ impl App {
             KeyCode::PageUp => self.scroll_console_page(-1),
             KeyCode::PageDown => self.scroll_console_page(1),
             KeyCode::End => self.follow_console(),
+            KeyCode::Tab => self.complete_console_input(),
             KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.toggle_details()
             }
@@ -323,6 +324,7 @@ impl App {
             KeyCode::Right => move_cursor_right(&self.input, &mut self.input_cursor),
             KeyCode::Up | KeyCode::Home => self.input_cursor = 0,
             KeyCode::Down | KeyCode::End => self.input_cursor = self.input.len(),
+            KeyCode::Tab => self.complete_prompt_input(),
             KeyCode::Delete => delete_at_cursor(&mut self.input, self.input_cursor),
             KeyCode::Backspace | KeyCode::Char('h')
                 if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1115,6 +1117,29 @@ impl App {
     fn clear_console_input(&mut self) {
         self.console_input.clear();
         self.console_cursor = 0;
+    }
+
+    fn complete_console_input(&mut self) {
+        if let Some(directory) = self.selected().map(|server| server.directory.clone()) {
+            complete_input_token(
+                &mut self.console_input,
+                &mut self.console_cursor,
+                &directory,
+            );
+        }
+    }
+
+    fn complete_prompt_input(&mut self) {
+        let directory = match self.mode {
+            Mode::Command | Mode::EditStartupCommand => {
+                self.selected().map(|server| server.directory.clone())
+            }
+            Mode::AddStartupCommand => Some(PathBuf::from(self.draft.dir.trim())),
+            _ => None,
+        };
+        if let Some(directory) = directory {
+            complete_input_token(&mut self.input, &mut self.input_cursor, &directory);
+        }
     }
 
     fn update_console_layout(&mut self, area: Rect) {
@@ -2062,7 +2087,7 @@ fn normalize_startup_parts(parts: Vec<String>) -> NormalizedStartup {
             jar_path: None,
             min_memory_mb: None,
             max_memory_mb: None,
-            java_args: parts,
+            java_args: Vec::new(),
             server_args: Vec::new(),
             changed: false,
         };
@@ -2123,6 +2148,114 @@ fn looks_like_java_bin(value: &str) -> bool {
         .and_then(|name| name.to_str())
         .unwrap_or(value);
     name == "java" || name.starts_with("java")
+}
+
+fn complete_input_token(input: &mut String, cursor: &mut usize, directory: &Path) -> bool {
+    let cursor_pos = (*cursor).min(input.len());
+    if !input.is_char_boundary(cursor_pos) {
+        return false;
+    }
+    let start = input[..cursor_pos]
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(0);
+    let prefix = &input[start..cursor_pos];
+    if prefix.is_empty() {
+        return false;
+    }
+
+    let is_first_token = input[..start].trim().is_empty();
+    let Some(completion) = complete_token(prefix, directory, is_first_token) else {
+        return false;
+    };
+
+    input.replace_range(start..cursor_pos, &completion);
+    *cursor = start + completion.len();
+    true
+}
+
+fn complete_token(prefix: &str, directory: &Path, is_first_token: bool) -> Option<String> {
+    let mut candidates = path_completion_candidates(prefix, directory);
+    if is_first_token && !prefix.contains('/') {
+        candidates.extend(path_command_candidates(prefix));
+    }
+    candidates.sort();
+    candidates.dedup();
+
+    match candidates.as_slice() {
+        [] => None,
+        [candidate] => Some(candidate.clone()),
+        _ => {
+            let common = longest_common_prefix(&candidates);
+            (common.len() > prefix.len()).then_some(common)
+        }
+    }
+}
+
+fn path_completion_candidates(prefix: &str, directory: &Path) -> Vec<String> {
+    let (dir_prefix, name_prefix) = prefix
+        .rfind('/')
+        .map(|index| (&prefix[..=index], &prefix[index + 1..]))
+        .unwrap_or(("", prefix));
+    let lookup_dir = if dir_prefix.is_empty() {
+        directory.to_path_buf()
+    } else {
+        let path = Path::new(dir_prefix);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            directory.join(path)
+        }
+    };
+
+    let Ok(entries) = fs::read_dir(lookup_dir) else {
+        return Vec::new();
+    };
+
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            if !name.starts_with(name_prefix) {
+                return None;
+            }
+            let suffix = entry
+                .file_type()
+                .ok()
+                .filter(|file_type| file_type.is_dir())
+                .map(|_| "/")
+                .unwrap_or(" ");
+            Some(format!("{dir_prefix}{name}{suffix}"))
+        })
+        .collect()
+}
+
+fn path_command_candidates(prefix: &str) -> Vec<String> {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .filter_map(|path| fs::read_dir(path).ok())
+        .flat_map(|entries| entries.filter_map(|entry| entry.ok()))
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            if !name.starts_with(prefix) || !entry.file_type().ok()?.is_file() {
+                return None;
+            }
+            Some(format!("{name} "))
+        })
+        .collect()
+}
+
+fn longest_common_prefix(values: &[String]) -> String {
+    let mut prefix = values.first().cloned().unwrap_or_default();
+    for value in &values[1..] {
+        while !prefix.is_empty() && !value.starts_with(&prefix) {
+            prefix.pop();
+        }
+    }
+    prefix
 }
 
 fn wrap_console_lines(lines: &[String], width: usize) -> Vec<String> {
@@ -2305,6 +2438,35 @@ mod tests {
         assert_eq!(parsed.jar_path.as_deref(), Some(Path::new("velocity.jar")));
         assert_eq!(parsed.java_args, vec!["-Dfoo=bar"]);
         assert_eq!(parsed.server_args, vec!["nogui"]);
+    }
+
+    #[test]
+    fn keeps_non_java_startup_command_out_of_java_args() {
+        let parsed = parse_startup_command("sh start.sh", Path::new("."));
+
+        assert_eq!(parsed.java_path, None);
+        assert_eq!(parsed.jar_path, None);
+        assert_eq!(parsed.java_args, Vec::<String>::new());
+        assert_eq!(parsed.server_args, Vec::<String>::new());
+        assert!(!parsed.changed);
+    }
+
+    #[test]
+    fn completes_console_file_token_from_server_directory() {
+        let dir =
+            std::env::temp_dir().join(format!("remiaft-completion-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("start.sh"), "").unwrap();
+
+        let mut input = "sh sta".to_string();
+        let mut cursor = input.len();
+
+        assert!(complete_input_token(&mut input, &mut cursor, &dir));
+        assert_eq!(input, "sh start.sh ");
+        assert_eq!(cursor, input.len());
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
