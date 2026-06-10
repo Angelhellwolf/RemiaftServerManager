@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use crossterm::cursor;
 use crossterm::execute;
-use crossterm::terminal::{self, disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{self, disable_raw_mode, enable_raw_mode, ClearType};
 
 use crate::config::{ConfigStore, ServerConfig};
 
@@ -120,17 +120,7 @@ pub fn append_terminal_input(
     server: &ServerConfig,
     input: &str,
 ) -> Result<()> {
-    let input = sanitize_terminal_input(input);
-    if input.is_empty() {
-        return Ok(());
-    }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(command_path(store, server))?;
-    file.write_all(input.as_bytes())?;
-    file.flush()?;
-    Ok(())
+    append_terminal_bytes_to_queue(store, server, input.as_bytes())
 }
 
 pub fn request_terminal_resize(
@@ -154,20 +144,28 @@ pub fn attach_terminal(store: &ConfigStore, server: &ServerConfig) -> Result<()>
     let _ = request_terminal_resize(store, server, rows, cols);
 
     let log_path = minecraft_log_path(store, server);
-    let offset = fs::metadata(&log_path)
+    let log_len = fs::metadata(&log_path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
+    let replay_offset = log_len.saturating_sub(64 * 1024);
     let done = Arc::new(AtomicBool::new(false));
-    let output_done = Arc::clone(&done);
-    let output_thread = thread::spawn(move || tail_terminal_output(log_path, offset, output_done));
 
     let mut stdout = io::stdout();
+    execute!(
+        stdout,
+        terminal::Clear(ClearType::All),
+        cursor::MoveTo(0, 0)
+    )?;
     write!(
         stdout,
         "\r\n-- remiaft native console: {} --\r\nCtrl-U detach | Ctrl-C interrupt server | terminal scrollback for history\r\n\r\n",
         server.name
     )?;
+    replay_terminal_output(&minecraft_log_path(store, server), replay_offset)?;
     stdout.flush()?;
+
+    let output_done = Arc::clone(&done);
+    let output_thread = thread::spawn(move || tail_terminal_output(log_path, log_len, output_done));
 
     let mut stdin = io::stdin().lock();
     let mut buf = [0_u8; 1024];
@@ -210,8 +208,25 @@ fn append_terminal_bytes(store: &ConfigStore, server: &ServerConfig, bytes: &[u8
     if bytes.is_empty() {
         return Ok(());
     }
-    let input = String::from_utf8_lossy(bytes);
-    append_terminal_input(store, server, &input)
+    append_terminal_bytes_to_queue(store, server, bytes)
+}
+
+fn append_terminal_bytes_to_queue(
+    store: &ConfigStore,
+    server: &ServerConfig,
+    bytes: &[u8],
+) -> Result<()> {
+    let input = sanitize_terminal_bytes(bytes);
+    if input.is_empty() {
+        return Ok(());
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(command_path(store, server))?;
+    file.write_all(&input)?;
+    file.flush()?;
+    Ok(())
 }
 
 fn tail_terminal_output(path: PathBuf, mut offset: u64, done: Arc<AtomicBool>) {
@@ -240,6 +255,26 @@ fn tail_terminal_output(path: PathBuf, mut offset: u64, done: Arc<AtomicBool>) {
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn replay_terminal_output(path: &Path, offset: u64) -> Result<()> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return Ok(()),
+    };
+    file.seek(SeekFrom::Start(offset))?;
+    let mut stdout = io::stdout();
+    let mut buf = [0_u8; 8192];
+    loop {
+        match file.read(&mut buf)? {
+            0 => break,
+            n => {
+                stdout.write_all(&buf[..n])?;
+            }
+        }
+    }
+    stdout.flush()?;
+    Ok(())
 }
 
 struct AttachTerminalGuard;
@@ -331,6 +366,9 @@ fn run_server_once(
                 return Err(std::io::Error::last_os_error());
             }
             if libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::tcsetpgrp(slave_fd, libc::getpgrp()) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -472,22 +510,47 @@ fn launch_command(default_java: &str, server: &ServerConfig) -> Command {
 }
 
 fn sanitize_terminal_input(input: &str) -> String {
-    let mut output = String::new();
-    let mut chars = input.chars().peekable();
+    String::from_utf8_lossy(&sanitize_terminal_bytes(input.as_bytes())).into_owned()
+}
 
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\u{1b}' => {
-                if let Some(sequence) = read_allowed_input_escape(&mut chars) {
-                    output.push_str(&sequence);
+fn sanitize_terminal_bytes(input: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut index = 0;
+
+    while index < input.len() {
+        if input[index] == 0xc2 && input.get(index + 1) == Some(&0xa7) {
+            index += 2;
+            continue;
+        }
+        match input[index] {
+            0x1b => {
+                if let Some((sequence, consumed)) = read_allowed_input_escape_bytes(&input[index..])
+                {
+                    output.extend_from_slice(sequence);
+                    index += consumed;
+                } else {
+                    index += skip_escape_bytes(&input[index..]).max(1);
                 }
             }
-            '\u{8}' => output.push('\u{7f}'),
-            '\r' | '\n' | '\t' | '\u{1}'..='\u{1a}' | '\u{1c}'..='\u{1f}' | '\u{7f}' => {
-                output.push(ch)
+            0x08 => {
+                output.push(0x7f);
+                index += 1;
             }
-            _ if is_allowed_console_char(ch) => output.push(ch),
-            _ => {}
+            b'\r' | b'\n' | b'\t' | 0x01..=0x1a | 0x1c..=0x1f | 0x7f => {
+                output.push(input[index]);
+                index += 1;
+            }
+            0x20..=0x7e => {
+                output.push(input[index]);
+                index += 1;
+            }
+            0x80..=0xff => {
+                output.push(input[index]);
+                index += 1;
+            }
+            _ => {
+                index += 1;
+            }
         }
     }
 
@@ -498,67 +561,67 @@ pub fn is_allowed_console_char(ch: char) -> bool {
     ch >= ' ' && ch != '\u{7f}' && ch != '\u{a7}' && !ch.is_control()
 }
 
-fn read_allowed_input_escape<I>(chars: &mut std::iter::Peekable<I>) -> Option<String>
-where
-    I: Iterator<Item = char>,
-{
-    let introducer = chars.next()?;
-    match introducer {
-        '[' => {
-            let mut sequence = String::from("\u{1b}[");
-            for ch in chars.by_ref() {
-                sequence.push(ch);
-                if sequence.len() > 32 {
-                    return None;
-                }
-                if ('@'..='~').contains(&ch) {
-                    break;
-                }
+fn read_allowed_input_escape_bytes(input: &[u8]) -> Option<(&[u8], usize)> {
+    match input {
+        [0x1b, b'[', rest @ ..] => {
+            let end = rest.iter().position(|byte| (b'@'..=b'~').contains(byte))?;
+            let consumed = 2 + end + 1;
+            if consumed > 32 {
+                return None;
             }
-
-            is_allowed_csi_input(&sequence).then_some(sequence)
+            let sequence = &input[..consumed];
+            is_allowed_csi_input(sequence).then_some((sequence, consumed))
         }
-        'O' => {
-            let ch = chars.next()?;
-            matches!(ch, 'A'..='D' | 'F' | 'H' | 'P'..='S').then(|| format!("\u{1b}O{ch}"))
-        }
-        ']' => {
-            while let Some(ch) = chars.next() {
-                if ch == '\u{7}' {
-                    break;
-                }
-                if ch == '\u{1b}' && chars.peek() == Some(&'\\') {
-                    let _ = chars.next();
-                    break;
-                }
-            }
-            None
-        }
-        '(' | ')' => {
-            let _ = chars.next();
-            None
+        [0x1b, b'O', ch, ..] if matches!(*ch, b'A'..=b'D' | b'F' | b'H' | b'P'..=b'S') => {
+            Some((&input[..3], 3))
         }
         _ => None,
     }
 }
 
-fn is_allowed_csi_input(sequence: &str) -> bool {
-    let Some(body) = sequence.strip_prefix("\u{1b}[") else {
+fn skip_escape_bytes(input: &[u8]) -> usize {
+    match input {
+        [0x1b, b'[', rest @ ..] => rest
+            .iter()
+            .position(|byte| (b'@'..=b'~').contains(byte))
+            .map(|end| 2 + end + 1)
+            .unwrap_or(input.len()),
+        [0x1b, b']', rest @ ..] => {
+            let mut index = 2;
+            while index < 2 + rest.len() {
+                if input[index] == 0x07 {
+                    return index + 1;
+                }
+                if input[index] == 0x1b && input.get(index + 1) == Some(&b'\\') {
+                    return index + 2;
+                }
+                index += 1;
+            }
+            input.len()
+        }
+        [0x1b, b'(' | b')', ..] => input.len().min(3),
+        [0x1b, ..] => input.len().min(2),
+        _ => 0,
+    }
+}
+
+fn is_allowed_csi_input(sequence: &[u8]) -> bool {
+    let Some(body) = sequence.strip_prefix(b"\x1b[") else {
         return false;
     };
-    let Some(final_char) = body.chars().last() else {
+    let Some(final_char) = body.last().copied() else {
         return false;
     };
-    if !('@'..='~').contains(&final_char) {
+    if !(b'@'..=b'~').contains(&final_char) {
         return false;
     }
-    let prefix_len = body.len().saturating_sub(final_char.len_utf8());
-    if matches!(final_char, 'M' | 'm') && body.starts_with('<') {
+    let prefix_len = body.len().saturating_sub(1);
+    if matches!(final_char, b'M' | b'm') && body.starts_with(b"<") {
         return false;
     }
-    body[..prefix_len]
-        .chars()
-        .all(|ch| ch.is_ascii_digit() || matches!(ch, ';' | '?' | '>' | '<' | ':' | ' '))
+    body[..prefix_len].iter().all(|byte| {
+        byte.is_ascii_digit() || matches!(*byte, b';' | b'?' | b'>' | b'<' | b':' | b' ')
+    })
 }
 
 #[cfg(unix)]
@@ -598,14 +661,18 @@ fn pump_terminal_commands(path: &Path, offset: u64, terminal: &mut impl Write) -
     }
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(offset))?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf)?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    let read_len = buf.len();
     if !buf.is_empty() {
-        let terminal_input = buf.replace('\n', "\r");
-        terminal.write_all(terminal_input.as_bytes())?;
+        let terminal_input = buf
+            .into_iter()
+            .map(|byte| if byte == b'\n' { b'\r' } else { byte })
+            .collect::<Vec<_>>();
+        terminal.write_all(&terminal_input)?;
         terminal.flush()?;
     }
-    Ok(offset + buf.len() as u64)
+    Ok(offset + read_len as u64)
 }
 
 #[cfg(unix)]
@@ -687,6 +754,14 @@ fn configure_pty_slave(slave_fd: i32) -> Result<()> {
         return Err(std::io::Error::last_os_error()).context("read pty termios");
     }
     termios.c_cc[libc::VERASE] = 0x7f;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        termios.c_oflag &= !libc::TABDLY;
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        termios.c_oflag &= !libc::OXTABS;
+    }
     if unsafe { libc::tcsetattr(slave_fd, libc::TCSANOW, &termios) } == -1 {
         return Err(std::io::Error::last_os_error()).context("configure pty terminal flags");
     }
