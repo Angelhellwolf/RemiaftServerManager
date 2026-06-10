@@ -171,7 +171,7 @@ fn run_server_once(
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) == -1 {
+            if libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -329,7 +329,7 @@ fn pump_terminal_commands(path: &Path, offset: u64, terminal: &mut impl Write) -
 fn open_pty() -> Result<(File, i32)> {
     let mut master_fd = 0;
     let mut slave_fd = 0;
-    let size = libc::winsize {
+    let mut size = libc::winsize {
         ws_row: 40,
         ws_col: 160,
         ws_xpixel: 0,
@@ -340,8 +340,8 @@ fn open_pty() -> Result<(File, i32)> {
             &mut master_fd,
             &mut slave_fd,
             ptr::null_mut(),
-            ptr::null(),
-            &size,
+            ptr::null_mut(),
+            &mut size,
         )
     };
     if rc == -1 {
