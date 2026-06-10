@@ -60,15 +60,14 @@ Inside the TUI:
 ```text
 u edit the startup command, for example: java -Xms1G -Xmx4G -jar server.jar nogui
 o open/close live console for the selected server
-type in the console and press Enter to send a command
-Tab in the live console is forwarded to the running server terminal, so Unix PTY
-servers use the same completion path as the vanilla Minecraft console
+type directly in the console; input is forwarded to the running server PTY
+Tab in the live console is forwarded to the running server terminal, so servers
+use their native Minecraft/Paper completion path
 Ctrl-C in the live console sends an interrupt to the selected server
 Ctrl-U detach from the console view without stopping the server
 b show/hide the right side panel
-Up/Down scroll console output when console is open
-PageUp/PageDown scroll console output faster
-End follow new console output again
+Up/Down are forwarded to the server terminal, usually for command history
+PageUp/PageDown scroll console output
 n add server
 s start selected server
 x stop selected server

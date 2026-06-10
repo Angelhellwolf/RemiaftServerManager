@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 
@@ -39,10 +39,14 @@ pub async fn run(store: ConfigStore) -> Result<()> {
         }
         terminal.draw(|frame| render::draw(frame, &app))?;
         if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
-                if app.handle_key(key).await? {
-                    break;
+            match event::read()? {
+                Event::Key(key) => {
+                    if app.handle_key(key).await? {
+                        break;
+                    }
                 }
+                Event::Mouse(mouse) => app.handle_mouse(mouse),
+                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
             }
         }
     }
@@ -113,8 +117,6 @@ struct App {
     console_end: Option<usize>,
     console_follow: bool,
     console_wrap_width: usize,
-    console_input: String,
-    console_cursor: usize,
     needs_screen_clear: bool,
 }
 
@@ -154,8 +156,6 @@ impl App {
             console_end: None,
             console_follow: true,
             console_wrap_width: 120,
-            console_input: String::new(),
-            console_cursor: 0,
             needs_screen_clear: false,
         })
     }
@@ -176,6 +176,17 @@ impl App {
             }
             Mode::Normal => self.handle_normal_key(key).await,
             _ => self.handle_input_key(key),
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if !matches!(self.mode, Mode::Normal) || self.main_view != MainView::Console {
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_console(-3),
+            MouseEventKind::ScrollDown => self.scroll_console(3),
+            _ => {}
         }
     }
 
@@ -250,79 +261,32 @@ impl App {
                 self.leave_console();
             }
             KeyCode::Esc => {
-                if self.console_input.is_empty() {
-                    self.leave_console();
-                } else {
-                    self.send_console_terminal_input("\u{15}")?;
-                    self.clear_console_input();
-                }
+                self.leave_console();
             }
-            KeyCode::Enter => self.send_console_input()?,
-            KeyCode::Left => {
-                let old_cursor = self.console_cursor;
-                move_cursor_left(&self.console_input, &mut self.console_cursor);
-                if self.console_cursor != old_cursor {
-                    self.send_console_terminal_input("\u{1b}[D")?;
-                }
-            }
-            KeyCode::Right => {
-                let old_cursor = self.console_cursor;
-                move_cursor_right(&self.console_input, &mut self.console_cursor);
-                if self.console_cursor != old_cursor {
-                    self.send_console_terminal_input("\u{1b}[C")?;
-                }
-            }
-            KeyCode::Home => {
-                if self.console_cursor > 0 {
-                    self.console_cursor = 0;
-                    self.send_console_terminal_input("\u{1}")?;
-                }
-            }
-            KeyCode::End if !self.console_input.is_empty() => {
-                if self.console_cursor != self.console_input.len() {
-                    self.console_cursor = self.console_input.len();
-                    self.send_console_terminal_input("\u{5}")?;
-                }
-            }
-            KeyCode::Delete => {
-                let old_input = self.console_input.clone();
-                delete_at_cursor(&mut self.console_input, self.console_cursor);
-                if self.console_input != old_input {
-                    self.send_console_terminal_input("\u{1b}[3~")?;
-                }
-            }
+            KeyCode::Enter => self.send_console_terminal_input("\r").map(|_| ())?,
+            KeyCode::Left => self.send_console_terminal_input("\u{1b}[D").map(|_| ())?,
+            KeyCode::Right => self.send_console_terminal_input("\u{1b}[C").map(|_| ())?,
+            KeyCode::Up => self.send_console_terminal_input("\u{1b}[A").map(|_| ())?,
+            KeyCode::Down => self.send_console_terminal_input("\u{1b}[B").map(|_| ())?,
+            KeyCode::Home => self.send_console_terminal_input("\u{1b}[H").map(|_| ())?,
+            KeyCode::End => self.send_console_terminal_input("\u{1b}[F").map(|_| ())?,
+            KeyCode::Delete => self.send_console_terminal_input("\u{1b}[3~").map(|_| ())?,
             KeyCode::Backspace | KeyCode::Char('h')
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     || key.code == KeyCode::Backspace =>
             {
-                let old_cursor = self.console_cursor;
-                backspace_at_cursor(&mut self.console_input, &mut self.console_cursor);
-                if self.console_cursor != old_cursor {
-                    let sequence = if key.code == KeyCode::Backspace {
-                        "\u{7f}"
-                    } else {
-                        "\u{8}"
-                    };
-                    self.send_console_terminal_input(sequence)?;
-                }
+                self.send_console_terminal_input("\u{7f}")?;
             }
-            KeyCode::Up => self.scroll_console(-1),
-            KeyCode::Down => self.scroll_console(1),
             KeyCode::PageUp => self.scroll_console_page(-1),
             KeyCode::PageDown => self.scroll_console_page(1),
-            KeyCode::End => self.follow_console(),
-            KeyCode::Tab => {
-                if !self.send_console_terminal_input("\t")? {
-                    self.complete_console_input();
-                }
-            }
+            KeyCode::Tab => self.send_console_terminal_input("\t").map(|_| ())?,
             KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.toggle_details()
             }
             KeyCode::Char(ch)
-                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                    && process::is_allowed_console_char(ch) =>
             {
-                insert_at_cursor(&mut self.console_input, &mut self.console_cursor, ch);
                 let mut encoded = [0; 4];
                 self.send_console_terminal_input(ch.encode_utf8(&mut encoded))?;
             }
@@ -957,27 +921,6 @@ impl App {
         }
     }
 
-    fn send_console_input(&mut self) -> Result<()> {
-        let command = self.console_input.trim().to_string();
-        let live = self.send_console_terminal_input("\r")?;
-        if !live && command.is_empty() {
-            return Ok(());
-        }
-        if !live {
-            if let Some(server) = self.selected() {
-                process::append_command(&self.store, server, &command)?;
-                self.status = format!("{} {}", self.t(Text::SentCommand), server.name);
-            }
-        } else if !command.is_empty() {
-            if let Some(server) = self.selected() {
-                self.status = format!("{} {}", self.t(Text::SentCommand), server.name);
-            }
-        }
-        self.clear_console_input();
-        self.follow_console();
-        Ok(())
-    }
-
     fn send_console_terminal_input(&self, input: &str) -> Result<bool> {
         let Some(server) = self
             .selected()
@@ -1000,7 +943,6 @@ impl App {
             return Ok(());
         }
         process::interrupt_server(&self.store, &server)?;
-        self.clear_console_input();
         self.console_follow = true;
         self.console_end = None;
         self.status = match self.language {
@@ -1034,11 +976,7 @@ impl App {
     }
 
     fn leave_console(&mut self) {
-        if !self.console_input.is_empty() {
-            let _ = self.send_console_terminal_input("\u{15}");
-        }
         self.main_view = MainView::Details;
-        self.clear_console_input();
         self.queue_screen_clear();
         self.status = self.t(Text::Help).to_string();
     }
@@ -1211,21 +1149,6 @@ impl App {
     fn clear_input(&mut self) {
         self.input.clear();
         self.input_cursor = 0;
-    }
-
-    fn clear_console_input(&mut self) {
-        self.console_input.clear();
-        self.console_cursor = 0;
-    }
-
-    fn complete_console_input(&mut self) {
-        if let Some(directory) = self.selected().map(|server| server.directory.clone()) {
-            complete_input_token(
-                &mut self.console_input,
-                &mut self.console_cursor,
-                &directory,
-            );
-        }
     }
 
     fn complete_prompt_input(&mut self) {

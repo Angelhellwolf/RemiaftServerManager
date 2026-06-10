@@ -442,23 +442,7 @@ fn draw_console(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let input_height = if area.height >= 6 {
-        3
-    } else if area.height >= 3 {
-        1
-    } else {
-        0
-    };
-    if input_height == 0 {
-        draw_console_log(frame, app, area);
-        return;
-    }
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(input_height)])
-        .split(area);
-    draw_console_log(frame, app, chunks[0]);
-    draw_console_input(frame, app, chunks[1]);
+    draw_console_log(frame, app, area);
 }
 
 fn draw_console_log(frame: &mut Frame, app: &App, area: Rect) {
@@ -492,46 +476,6 @@ fn draw_console_log(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(lines).wrap(Wrap { trim: false })
     };
     frame.render_widget(paragraph, area);
-}
-
-fn draw_console_input(frame: &mut Frame, app: &App, area: Rect) {
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-    let bordered = area.height >= 3 && area.width >= 4;
-    let input_width = if bordered {
-        area.width.saturating_sub(2).max(1) as usize
-    } else {
-        area.width.max(1) as usize
-    };
-    let (visible_input, cursor_col) =
-        input_view(&app.console_input, app.console_cursor, input_width);
-    let input = if bordered {
-        Paragraph::new(visible_input)
-            .block(Block::default().borders(Borders::ALL).title(format!(
-                "{} - {}",
-                app.t(Text::ConsoleInput),
-                app.t(Text::ConsoleExitHint)
-            )))
-            .wrap(Wrap { trim: false })
-    } else {
-        Paragraph::new(visible_input).wrap(Wrap { trim: false })
-    };
-    frame.render_widget(input, area);
-    let cursor_x = if bordered {
-        area.x.saturating_add(1).saturating_add(cursor_col)
-    } else {
-        area.x.saturating_add(cursor_col)
-    };
-    let cursor_y = if bordered {
-        area.y.saturating_add(1)
-    } else {
-        area.y
-    };
-    frame.set_cursor_position(Position::new(
-        cursor_x.min(area.right().saturating_sub(1)),
-        cursor_y.min(area.bottom().saturating_sub(1)),
-    ));
 }
 
 fn draw_quick_panel(frame: &mut Frame, app: &App, area: Rect) {
@@ -572,7 +516,7 @@ fn shortcut_lines(app: &App) -> Vec<Line<'static>> {
             Line::from("o  console/details"),
             Line::from("i  send command"),
             Line::from("b  side panel"),
-            Line::from("End  follow output"),
+            Line::from("PgUp/PgDn  scroll console"),
             Line::from("s  start current"),
             Line::from("x  stop current"),
             Line::from("r  restart current"),
@@ -601,7 +545,7 @@ fn shortcut_lines(app: &App) -> Vec<Line<'static>> {
             Line::from("o  控制台/详情"),
             Line::from("i  发送命令"),
             Line::from("b  侧栏面板"),
-            Line::from("End  跟随输出"),
+            Line::from("PgUp/PgDn  滚动控制台"),
             Line::from("s  启动当前"),
             Line::from("x  停止当前"),
             Line::from("r  重启当前"),

@@ -117,6 +117,10 @@ pub fn append_terminal_input(
     server: &ServerConfig,
     input: &str,
 ) -> Result<()> {
+    let input = sanitize_terminal_input(input);
+    if input.is_empty() {
+        return Ok(());
+    }
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -174,6 +178,7 @@ fn run_server_once(
     fs::write(command_path(store, server), b"")?;
 
     let (master, slave_fd) = open_pty()?;
+    configure_pty_slave(slave_fd)?;
     set_nonblocking(&master)?;
     let slave = unsafe { File::from_raw_fd(slave_fd) };
     let stdin = slave.try_clone()?;
@@ -333,6 +338,79 @@ fn launch_command(default_java: &str, server: &ServerConfig) -> Command {
     }
 }
 
+fn sanitize_terminal_input(input: &str) -> String {
+    let mut output = String::new();
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\u{1b}' => {
+                if let Some(sequence) = read_allowed_input_escape(&mut chars) {
+                    output.push_str(sequence);
+                }
+            }
+            '\u{8}' => output.push('\u{7f}'),
+            '\r' | '\n' | '\t' | '\u{1}' | '\u{3}' | '\u{5}' | '\u{15}' | '\u{7f}' => {
+                output.push(ch);
+            }
+            _ if is_allowed_console_char(ch) => output.push(ch),
+            _ => {}
+        }
+    }
+
+    output
+}
+
+pub fn is_allowed_console_char(ch: char) -> bool {
+    ch >= ' ' && ch != '\u{7f}' && ch != '\u{a7}' && !ch.is_control()
+}
+
+fn read_allowed_input_escape<I>(chars: &mut std::iter::Peekable<I>) -> Option<&'static str>
+where
+    I: Iterator<Item = char>,
+{
+    let introducer = chars.next()?;
+    match introducer {
+        '[' => {
+            let mut sequence = String::from("\u{1b}[");
+            for ch in chars.by_ref() {
+                sequence.push(ch);
+                if ('@'..='~').contains(&ch) {
+                    break;
+                }
+            }
+
+            match sequence.as_str() {
+                "\u{1b}[A" => Some("\u{1b}[A"),
+                "\u{1b}[B" => Some("\u{1b}[B"),
+                "\u{1b}[C" => Some("\u{1b}[C"),
+                "\u{1b}[D" => Some("\u{1b}[D"),
+                "\u{1b}[F" => Some("\u{1b}[F"),
+                "\u{1b}[H" => Some("\u{1b}[H"),
+                "\u{1b}[3~" => Some("\u{1b}[3~"),
+                _ => None,
+            }
+        }
+        ']' => {
+            while let Some(ch) = chars.next() {
+                if ch == '\u{7}' {
+                    break;
+                }
+                if ch == '\u{1b}' && chars.peek() == Some(&'\\') {
+                    let _ = chars.next();
+                    break;
+                }
+            }
+            None
+        }
+        '(' | ')' => {
+            let _ = chars.next();
+            None
+        }
+        _ => None,
+    }
+}
+
 #[cfg(unix)]
 fn shell_command(command_line: &str) -> Command {
     let mut command = Command::new("sh");
@@ -424,6 +502,19 @@ fn open_pty() -> Result<(File, i32)> {
         return Err(std::io::Error::last_os_error()).context("open pty");
     }
     Ok((unsafe { File::from_raw_fd(master_fd) }, slave_fd))
+}
+
+#[cfg(unix)]
+fn configure_pty_slave(slave_fd: i32) -> Result<()> {
+    let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+    if unsafe { libc::tcgetattr(slave_fd, &mut termios) } == -1 {
+        return Err(std::io::Error::last_os_error()).context("read pty termios");
+    }
+    termios.c_cc[libc::VERASE] = 0x7f;
+    if unsafe { libc::tcsetattr(slave_fd, libc::TCSANOW, &termios) } == -1 {
+        return Err(std::io::Error::last_os_error()).context("set pty erase character");
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -559,4 +650,40 @@ fn kill_pid(pid: u32) -> Result<()> {
         .stderr(Stdio::null())
         .status()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_input_normalizes_backspace_to_delete() {
+        assert_eq!(sanitize_terminal_input("sa\u{8}y\r"), "sa\u{7f}y\r");
+    }
+
+    #[test]
+    fn terminal_input_keeps_known_editing_keys() {
+        assert_eq!(
+            sanitize_terminal_input(
+                "\u{1b}[A\u{1b}[B\u{1b}[C\u{1b}[D\u{1b}[H\u{1b}[F\u{1b}[3~\u{1}\u{5}\u{15}\t"
+            ),
+            "\u{1b}[A\u{1b}[B\u{1b}[C\u{1b}[D\u{1b}[H\u{1b}[F\u{1b}[3~\u{1}\u{5}\u{15}\t"
+        );
+    }
+
+    #[test]
+    fn terminal_input_drops_mouse_and_osc_sequences() {
+        assert_eq!(
+            sanitize_terminal_input("say hi\u{1b}[<64;12;9M\u{1b}]0;title\u{7}\r"),
+            "say hi\r"
+        );
+    }
+
+    #[test]
+    fn terminal_input_drops_disallowed_command_text() {
+        assert_eq!(
+            sanitize_terminal_input("say \u{a7}red\u{1b}bad\u{7f}\r"),
+            "say redad\u{7f}\r"
+        );
+    }
 }
