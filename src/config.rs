@@ -344,24 +344,26 @@ mod tests {
 
     #[test]
     fn deleting_group_preserves_servers_under_parent() {
-        let mut config = RemiaftConfig::default();
-        config.groups = vec![
-            ServerGroup {
-                id: "root".to_string(),
-                name: "root".to_string(),
-                parent_id: None,
-            },
-            ServerGroup {
-                id: "child".to_string(),
-                name: "child".to_string(),
-                parent_id: Some("root".to_string()),
-            },
-            ServerGroup {
-                id: "sibling".to_string(),
-                name: "sibling".to_string(),
-                parent_id: None,
-            },
-        ];
+        let mut config = RemiaftConfig {
+            groups: vec![
+                ServerGroup {
+                    id: "root".to_string(),
+                    name: "root".to_string(),
+                    parent_id: None,
+                },
+                ServerGroup {
+                    id: "child".to_string(),
+                    name: "child".to_string(),
+                    parent_id: Some("root".to_string()),
+                },
+                ServerGroup {
+                    id: "sibling".to_string(),
+                    name: "sibling".to_string(),
+                    parent_id: None,
+                },
+            ],
+            ..Default::default()
+        };
         config.add_server(
             "root server".to_string(),
             PathBuf::from("."),
