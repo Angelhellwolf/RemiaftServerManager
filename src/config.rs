@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -108,6 +108,7 @@ impl RemiaftConfig {
             auto_restart: false,
             restart_delay_secs: 10,
             version: None,
+            runtime: ServerRuntimeConfig::default(),
         });
     }
 
@@ -115,6 +116,13 @@ impl RemiaftConfig {
         self.servers
             .iter()
             .find(|server| server.id == key || server.name == key)
+            .ok_or_else(|| anyhow!("unknown server: {key}"))
+    }
+
+    pub fn find_server_index(&self, key: &str) -> Result<usize> {
+        self.servers
+            .iter()
+            .position(|server| server.id == key || server.name == key)
             .ok_or_else(|| anyhow!("unknown server: {key}"))
     }
 
@@ -276,6 +284,8 @@ pub struct ServerConfig {
     pub auto_restart: bool,
     pub restart_delay_secs: u64,
     pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub runtime: ServerRuntimeConfig,
 }
 
 impl ServerConfig {
@@ -295,6 +305,227 @@ impl ServerConfig {
         parts.extend(self.server_args.clone());
         parts.join(" ")
     }
+
+    pub fn uses_docker(&self) -> bool {
+        self.runtime.kind == ServerRuntimeKind::Docker
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ServerRuntimeConfig {
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub kind: ServerRuntimeKind,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub docker: DockerServerConfig,
+}
+
+impl Default for ServerRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            kind: ServerRuntimeKind::Native,
+            docker: DockerServerConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServerRuntimeKind {
+    #[default]
+    Native,
+    Docker,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DockerServerConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_candidates: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub image_policy: DockerImagePolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<DockerPortMapping>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<DockerVolumeMount>,
+    #[serde(default = "default_mount_server_directory")]
+    pub mount_server_directory: bool,
+    #[serde(default = "default_docker_server_dir")]
+    pub server_dir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_command: Option<String>,
+    #[serde(default)]
+    pub use_image_entrypoint: bool,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub user: DockerUserConfig,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub rcon: RconConfig,
+    #[serde(default)]
+    pub auto_remove: bool,
+}
+
+impl Default for DockerServerConfig {
+    fn default() -> Self {
+        Self {
+            image: None,
+            image_candidates: Vec::new(),
+            image_policy: DockerImagePolicy::IfMissing,
+            container_name: None,
+            network: None,
+            labels: BTreeMap::new(),
+            environment: BTreeMap::new(),
+            ports: Vec::new(),
+            volumes: Vec::new(),
+            mount_server_directory: true,
+            server_dir: default_docker_server_dir(),
+            working_dir: None,
+            startup_command: None,
+            use_image_entrypoint: false,
+            user: DockerUserConfig::default(),
+            rcon: RconConfig::default(),
+            auto_remove: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DockerImagePolicy {
+    #[default]
+    IfMissing,
+    Always,
+    Never,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DockerPortMapping {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub container_port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub protocol: DockerProtocol,
+}
+
+impl DockerPortMapping {
+    pub fn tcp(name: impl Into<String>, container_port: u16, host_port: Option<u16>) -> Self {
+        Self {
+            name: Some(name.into()),
+            container_port,
+            host_port,
+            host_ip: None,
+            protocol: DockerProtocol::Tcp,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
+#[serde(rename_all = "lowercase")]
+pub enum DockerProtocol {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+impl DockerProtocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DockerVolumeMount {
+    pub host: PathBuf,
+    pub container: String,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DockerUserConfig {
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub mode: DockerUserMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gid: Option<u32>,
+}
+
+impl Default for DockerUserConfig {
+    fn default() -> Self {
+        Self {
+            mode: DockerUserMode::Auto,
+            uid: None,
+            gid: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DockerUserMode {
+    #[default]
+    Auto,
+    Host,
+    Image,
+    Custom,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct RconConfig {
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub mode: RconMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(default = "default_rcon_container_port")]
+    pub container_port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_port: Option<u16>,
+    #[serde(default = "default_rcon_host")]
+    pub host: String,
+    #[serde(default = "default_rcon_port_start")]
+    pub port_range_start: u16,
+    #[serde(default = "default_rcon_port_end")]
+    pub port_range_end: u16,
+}
+
+impl Default for RconConfig {
+    fn default() -> Self {
+        Self {
+            mode: RconMode::Auto,
+            password: None,
+            container_port: default_rcon_container_port(),
+            host_port: None,
+            host: default_rcon_host(),
+            port_range_start: default_rcon_port_start(),
+            port_range_end: default_rcon_port_end(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RconMode {
+    #[default]
+    Auto,
+    Manual,
+    Disabled,
 }
 
 fn slug(input: &str) -> String {
@@ -324,6 +555,37 @@ fn slug(input: &str) -> String {
     }
 }
 
+fn default_docker_server_dir() -> String {
+    "/home/remiaft/server".to_string()
+}
+
+fn default_mount_server_directory() -> bool {
+    true
+}
+
+fn default_rcon_container_port() -> u16 {
+    25575
+}
+
+fn default_rcon_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_rcon_port_start() -> u16 {
+    25575
+}
+
+fn default_rcon_port_end() -> u16 {
+    25999
+}
+
+fn is_default<T>(value: &T) -> bool
+where
+    T: Default + PartialEq,
+{
+    value == &T::default()
+}
+
 fn looks_like_java_bin(value: &str) -> bool {
     let name = Path::new(value)
         .file_name()
@@ -340,6 +602,80 @@ mod tests {
     fn slug_has_stable_fallback() {
         assert_eq!(slug("Survival SMP"), "survival-smp");
         assert_eq!(slug("***"), "server");
+    }
+
+    #[test]
+    fn missing_runtime_defaults_to_native() {
+        let raw = r#"
+java_path = "java"
+groups = []
+
+[[servers]]
+id = "survival-12345678"
+name = "survival"
+directory = "."
+jar_path = "server.jar"
+min_memory_mb = 1024
+max_memory_mb = 4096
+java_args = []
+server_args = ["nogui"]
+auto_restart = false
+restart_delay_secs = 10
+"#;
+
+        let config: RemiaftConfig = toml::from_str(raw).unwrap();
+
+        assert_eq!(config.servers[0].runtime.kind, ServerRuntimeKind::Native);
+    }
+
+    #[test]
+    fn docker_runtime_config_round_trips() {
+        let raw = r#"
+java_path = "java"
+groups = []
+
+[[servers]]
+id = "room-12345678"
+name = "room"
+directory = "."
+jar_path = "server.jar"
+min_memory_mb = 1024
+max_memory_mb = 4096
+java_args = []
+server_args = ["nogui"]
+auto_restart = false
+restart_delay_secs = 10
+
+[servers.runtime]
+kind = "docker"
+
+[servers.runtime.docker]
+image = "example/room:latest"
+mount_server_directory = false
+use_image_entrypoint = true
+auto_remove = true
+
+[servers.runtime.docker.rcon]
+mode = "auto"
+host_port = 25575
+password = "secret"
+"#;
+
+        let config: RemiaftConfig = toml::from_str(raw).unwrap();
+        let server = &config.servers[0];
+
+        assert_eq!(server.runtime.kind, ServerRuntimeKind::Docker);
+        assert_eq!(
+            server.runtime.docker.image.as_deref(),
+            Some("example/room:latest")
+        );
+        assert!(!server.runtime.docker.mount_server_directory);
+        assert!(server.runtime.docker.use_image_entrypoint);
+        assert_eq!(server.runtime.docker.rcon.host_port, Some(25575));
+        assert_eq!(
+            server.runtime.docker.rcon.password.as_deref(),
+            Some("secret")
+        );
     }
 
     #[test]

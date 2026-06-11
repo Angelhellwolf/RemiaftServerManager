@@ -45,6 +45,9 @@ $HOME/.local/bin/remiaft
 ```sh
 remiaft
 remiaft status
+remiaft add survival --dir /srv/survival --jar server.jar
+remiaft add room-1 --dir /srv/room-1 --docker --image eclipse-temurin:21-jre
+remiaft docker room-1 --port 25565:25565 --volume /srv/shared/plugins:/home/remiaft/server/plugins:ro
 remiaft start survival
 remiaft stop survival
 remiaft restart survival
@@ -79,6 +82,10 @@ d delete selected server/group
 q quit
 ```
 
+The TUI server creation flow asks for the runtime backend. Choose `native` for
+the classic supervisor flow or `docker` for Docker-backed rooms. Docker creation
+then asks for image, directory mapping, image entrypoint usage, and RCON mode.
+
 The startup command is the normal terminal command you would run by hand.
 `remiaft` parses it into Java path, memory flags, jar path, JVM args, and server
 args, then keeps managing it without requiring `screen`.
@@ -101,6 +108,14 @@ enabled. The next time `remiaft` opens, it reloads the saved config and reads
 runtime PID files to show the existing server state. This removes the need to
 switch into `screen` sessions.
 
+Docker-backed servers use Docker Engine API through the local Docker socket
+instead of shelling out to the `docker` CLI. Remiaft labels every managed
+container with `remiaft.manager=true` and `com.remiaft.server_id=<id>`, and
+refuses to manage any container without that marker. Docker server commands are
+sent through RCON. In automatic RCON mode, Remiaft generates a password, stores
+it in `config.toml`, allocates a host port from `25575-25999`, and updates
+`server.properties` when the server directory is bind-mounted.
+
 ## Config
 
 The config file is created on first run:
@@ -113,6 +128,95 @@ Runtime files and logs are stored below the user's local data directory, usually
 
 ```text
 ~/.local/share/remiaft/runtime
+```
+
+### Docker Servers
+
+Set a server's runtime to Docker in `config.toml`:
+
+```toml
+[[servers]]
+id = "survival-12345678"
+name = "survival"
+directory = "/home/remiaft/servers/survival"
+jar_path = "server.jar"
+min_memory_mb = 1024
+max_memory_mb = 4096
+java_args = []
+server_args = ["nogui"]
+auto_restart = false
+restart_delay_secs = 10
+
+[servers.runtime]
+kind = "docker"
+
+[servers.runtime.docker]
+# Empty image means Remiaft chooses a Java image from the Minecraft version.
+# For example, 1.21 defaults to eclipse-temurin:21-jre.
+mount_server_directory = true
+server_dir = "/home/remiaft/server"
+
+[servers.runtime.docker.rcon]
+mode = "auto"
+port_range_start = 25575
+port_range_end = 25999
+```
+
+For reusable room images such as Bed Wars rooms that do not need map
+persistence, let the image start the server and disable the default bind mount:
+
+```toml
+[servers.runtime]
+kind = "docker"
+
+[servers.runtime.docker]
+image = "your-registry/bedwars-room:latest"
+mount_server_directory = false
+use_image_entrypoint = true
+auto_remove = true
+```
+
+Custom ports and volumes are explicit:
+
+```toml
+[[servers.runtime.docker.ports]]
+name = "minecraft"
+container_port = 25565
+host_port = 25565
+protocol = "tcp"
+
+[[servers.runtime.docker.ports]]
+name = "rcon"
+container_port = 25575
+host_port = 25575
+host_ip = "127.0.0.1"
+protocol = "tcp"
+
+[[servers.runtime.docker.volumes]]
+host = "/home/remiaft/shared/plugins"
+container = "/home/remiaft/server/plugins"
+read_only = false
+```
+
+When a bind mount is used, Remiaft runs the container as the host user's numeric
+UID/GID by default. This keeps files created by Minecraft readable and writable
+by the local user instead of root.
+
+Remiaft refuses dangerous Docker settings before starting a container: host
+paths such as `/`, `/etc`, `/root`, and `/var/run/docker.sock` cannot be
+bind-mounted, privileged containers are not allowed, and host PID or host
+network mode is rejected. Docker API calls are appended to
+`~/.local/share/remiaft/runtime/docker-audit.log`.
+
+The same Docker fields can be configured from the CLI:
+
+```sh
+remiaft add paper --dir /home/remiaft/servers/paper --jar server.jar \
+  --docker --image eclipse-temurin:21-jre --rcon auto
+
+remiaft docker paper --port 25565:25565
+remiaft docker paper --volume /home/remiaft/shared/plugins:/home/remiaft/server/plugins:ro
+remiaft docker paper --no-mount --use-image-entrypoint --image your-registry/bedwars-room:latest
 ```
 
 ## Minecraft Versions

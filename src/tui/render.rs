@@ -352,7 +352,7 @@ fn detail_panel_height(app: &App, width: u16) -> u16 {
 
 fn detail_lines(app: &App) -> Vec<Line<'static>> {
     if let Some(server) = app.selected() {
-        vec![
+        let mut lines = vec![
             Line::from(vec![
                 Span::styled(
                     format!("{}: {}", app.t(Text::Name), server.name),
@@ -402,7 +402,9 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
                 app.t(Text::ServerArgs),
                 server.server_args.join(" ")
             )),
-        ]
+        ];
+        lines.extend(docker_detail_lines(app, server));
+        lines
     } else if let Some(group_id) = app.selected_group_id() {
         let name = app
             .config
@@ -455,6 +457,123 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
             Line::from(app.t(Text::CustomJarHint)),
         ]
     }
+}
+
+fn docker_detail_lines(app: &App, server: &crate::config::ServerConfig) -> Vec<Line<'static>> {
+    let runtime = match server.runtime.kind {
+        crate::config::ServerRuntimeKind::Native => match app.language {
+            Language::English => "native process",
+            Language::ChineseSimplified => "本机进程",
+        },
+        crate::config::ServerRuntimeKind::Docker => "docker",
+    };
+    let mut lines = vec![Line::from(match app.language {
+        Language::English => format!("Runtime: {runtime}"),
+        Language::ChineseSimplified => format!("运行后端：{runtime}"),
+    })];
+
+    if !server.uses_docker() {
+        return lines;
+    }
+
+    let docker = &server.runtime.docker;
+    let image = docker
+        .image
+        .as_deref()
+        .filter(|image| !image.trim().is_empty())
+        .unwrap_or("auto");
+    let network = docker.network.as_deref().unwrap_or("remiaft");
+    let container = docker
+        .container_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("auto");
+    lines.push(Line::from(match app.language {
+        Language::English => format!("Docker image: {image} | container: {container}"),
+        Language::ChineseSimplified => format!("Docker 镜像：{image} | 容器：{container}"),
+    }));
+    lines.push(Line::from(match app.language {
+        Language::English => format!(
+            "Docker network: {network} | server dir: {} | entrypoint: {}",
+            docker.server_dir, docker.use_image_entrypoint
+        ),
+        Language::ChineseSimplified => format!(
+            "Docker 网络：{network} | 容器目录：{} | 使用镜像入口：{}",
+            docker.server_dir, docker.use_image_entrypoint
+        ),
+    }));
+    let ports = if docker.ports.is_empty() {
+        "auto".to_string()
+    } else {
+        docker
+            .ports
+            .iter()
+            .map(|port| {
+                format!(
+                    "{}:{}->{}/{}",
+                    port.name.as_deref().unwrap_or("port"),
+                    port.host_port
+                        .map(|port| port.to_string())
+                        .unwrap_or_else(|| "auto".to_string()),
+                    port.container_port,
+                    port.protocol.as_str()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    lines.push(Line::from(match app.language {
+        Language::English => format!("Docker ports: {ports}"),
+        Language::ChineseSimplified => format!("Docker 端口：{ports}"),
+    }));
+    let volumes = if docker.mount_server_directory {
+        format!("{} -> {}", server.directory.display(), docker.server_dir)
+    } else if docker.volumes.is_empty() {
+        "none".to_string()
+    } else {
+        docker
+            .volumes
+            .iter()
+            .map(|volume| {
+                format!(
+                    "{} -> {}{}",
+                    volume.host.display(),
+                    volume.container,
+                    if volume.read_only { " (ro)" } else { "" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    lines.push(Line::from(match app.language {
+        Language::English => format!("Docker volumes: {volumes}"),
+        Language::ChineseSimplified => format!("Docker 映射：{volumes}"),
+    }));
+    lines.push(Line::from(match app.language {
+        Language::English => format!(
+            "RCON: {:?} | host {}:{} | container port {}",
+            docker.rcon.mode,
+            docker.rcon.host,
+            docker
+                .rcon
+                .host_port
+                .map(|port| port.to_string())
+                .unwrap_or_else(|| "auto".to_string()),
+            docker.rcon.container_port
+        ),
+        Language::ChineseSimplified => format!(
+            "RCON：{:?} | 本机 {}:{} | 容器端口 {}",
+            docker.rcon.mode,
+            docker.rcon.host,
+            docker
+                .rcon
+                .host_port
+                .map(|port| port.to_string())
+                .unwrap_or_else(|| "自动".to_string()),
+            docker.rcon.container_port
+        ),
+    }));
+    lines
 }
 
 fn draw_server_log(frame: &mut Frame, app: &App, area: Rect) {
@@ -629,8 +748,28 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Clear, area);
     let title = match app.mode {
         Mode::AddName => app.t(Text::InputNewName),
+        Mode::AddRuntime => match app.language {
+            Language::English => "Runtime backend",
+            Language::ChineseSimplified => "运行后端",
+        },
         Mode::AddDir => app.t(Text::InputNewDirectory),
         Mode::AddStartupCommand => app.t(Text::StartupCommand),
+        Mode::AddDockerImage => match app.language {
+            Language::English => "Docker image",
+            Language::ChineseSimplified => "Docker 镜像",
+        },
+        Mode::AddDockerMount => match app.language {
+            Language::English => "Docker directory mapping",
+            Language::ChineseSimplified => "Docker 目录映射",
+        },
+        Mode::AddDockerEntrypoint => match app.language {
+            Language::English => "Docker entrypoint",
+            Language::ChineseSimplified => "Docker 镜像入口",
+        },
+        Mode::AddDockerRcon => match app.language {
+            Language::English => "Docker RCON",
+            Language::ChineseSimplified => "Docker RCON",
+        },
         Mode::EditDir => app.t(Text::InputEditDirectory),
         Mode::EditJar => app.t(Text::InputEditJar),
         Mode::EditJavaPath => app.t(Text::InputEditJavaPath),

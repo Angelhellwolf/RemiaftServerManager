@@ -16,7 +16,8 @@ use crossterm::cursor;
 use crossterm::execute;
 use crossterm::terminal::{self, disable_raw_mode, enable_raw_mode, ClearType};
 
-use crate::config::{ConfigStore, ServerConfig};
+use crate::config::{ConfigStore, RemiaftConfig, ServerConfig, ServerRuntimeKind};
+use crate::docker;
 
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -45,6 +46,17 @@ impl RuntimeStatus {
 }
 
 pub fn runtime_status(store: &ConfigStore, server: &ServerConfig) -> RuntimeStatus {
+    if server.uses_docker() {
+        return match docker::runtime_status(server) {
+            docker::RuntimeStatus::Running => RuntimeStatus::Running,
+            docker::RuntimeStatus::Stopped => RuntimeStatus::Stopped,
+            docker::RuntimeStatus::Stale => RuntimeStatus::Stale,
+        };
+    }
+    native_runtime_status(store, server)
+}
+
+fn native_runtime_status(store: &ConfigStore, server: &ServerConfig) -> RuntimeStatus {
     match read_pid(&supervisor_pid_path(store, server)) {
         Ok(Some(pid)) if pid_alive(pid) => RuntimeStatus::Running,
         Ok(Some(_)) => RuntimeStatus::Stale,
@@ -52,8 +64,25 @@ pub fn runtime_status(store: &ConfigStore, server: &ServerConfig) -> RuntimeStat
     }
 }
 
+pub fn start_server(store: &ConfigStore, config: &mut RemiaftConfig, key: &str) -> Result<()> {
+    let index = config.find_server_index(key)?;
+    if config.servers[index].runtime.kind == ServerRuntimeKind::Docker {
+        let reserved_ports = reserved_docker_ports(config, &config.servers[index].id);
+        docker::prepare_server(&mut config.servers[index], &reserved_ports)?;
+        store.save(config)?;
+        return docker::start_server(store, &config.servers[index]);
+    }
+    start_supervisor(store, &config.servers[index])
+}
+
+pub fn restart_server(store: &ConfigStore, config: &mut RemiaftConfig, key: &str) -> Result<()> {
+    let server = config.find_server(key)?.clone();
+    stop_server(store, &server)?;
+    start_server(store, config, key)
+}
+
 pub fn start_supervisor(store: &ConfigStore, server: &ServerConfig) -> Result<()> {
-    if runtime_status(store, server) == RuntimeStatus::Running {
+    if native_runtime_status(store, server) == RuntimeStatus::Running {
         return Ok(());
     }
 
@@ -78,6 +107,13 @@ pub fn start_supervisor(store: &ConfigStore, server: &ServerConfig) -> Result<()
 }
 
 pub fn stop_server(store: &ConfigStore, server: &ServerConfig) -> Result<()> {
+    if server.uses_docker() {
+        return docker::stop_server(store, server);
+    }
+    stop_native_server(store, server)
+}
+
+fn stop_native_server(store: &ConfigStore, server: &ServerConfig) -> Result<()> {
     fs::create_dir_all(server_runtime_dir(store, server))?;
     fs::write(stop_flag_path(store, server), b"stop")?;
     append_command(store, server, "stop")?;
@@ -100,6 +136,9 @@ pub fn stop_server(store: &ConfigStore, server: &ServerConfig) -> Result<()> {
 }
 
 pub fn interrupt_server(store: &ConfigStore, server: &ServerConfig) -> Result<()> {
+    if server.uses_docker() {
+        return docker::interrupt_server(store, server);
+    }
     fs::create_dir_all(server_runtime_dir(store, server))?;
     fs::write(stop_flag_path(store, server), b"stop")?;
     append_terminal_input(store, server, "\u{3}")?;
@@ -107,6 +146,10 @@ pub fn interrupt_server(store: &ConfigStore, server: &ServerConfig) -> Result<()
 }
 
 pub fn append_command(store: &ConfigStore, server: &ServerConfig, command: &str) -> Result<()> {
+    if server.uses_docker() {
+        docker::send_rcon_command(server, command)?;
+        return Ok(());
+    }
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -120,6 +163,13 @@ pub fn append_terminal_input(
     server: &ServerConfig,
     input: &str,
 ) -> Result<()> {
+    if server.uses_docker() {
+        let command = input.trim_matches(['\r', '\n']);
+        if !command.trim().is_empty() {
+            docker::send_rcon_command(server, command.trim())?;
+        }
+        return Ok(());
+    }
     append_terminal_bytes_to_queue(store, server, input.as_bytes())
 }
 
@@ -129,12 +179,18 @@ pub fn request_terminal_resize(
     rows: u16,
     cols: u16,
 ) -> Result<()> {
+    if server.uses_docker() {
+        return Ok(());
+    }
     fs::create_dir_all(server_runtime_dir(store, server))?;
     fs::write(resize_path(store, server), format!("{rows} {cols}\n"))?;
     Ok(())
 }
 
 pub fn attach_terminal(store: &ConfigStore, server: &ServerConfig) -> Result<()> {
+    if server.uses_docker() {
+        return docker::attach_rcon_console(store, server);
+    }
     if runtime_status(store, server) != RuntimeStatus::Running {
         return Err(anyhow!("{} is not running", server.name));
     }
@@ -296,6 +352,10 @@ impl Drop for AttachTerminalGuard {
 }
 
 pub fn minecraft_log_path_for(store: &ConfigStore, server: &ServerConfig) -> PathBuf {
+    if server.uses_docker() {
+        let _ = docker::sync_logs(store, server);
+        return docker::minecraft_log_path(store, server);
+    }
     minecraft_log_path(store, server)
 }
 
@@ -814,6 +874,23 @@ fn append_file(path: &Path) -> Result<File> {
         .append(true)
         .open(path)
         .with_context(|| format!("open {}", path.display()))
+}
+
+fn reserved_docker_ports(config: &RemiaftConfig, except_server_id: &str) -> Vec<u16> {
+    config
+        .servers
+        .iter()
+        .filter(|server| server.id != except_server_id)
+        .flat_map(|server| {
+            let docker = &server.runtime.docker;
+            docker
+                .rcon
+                .host_port
+                .into_iter()
+                .chain(docker.ports.iter().filter_map(|port| port.host_port))
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 #[cfg(unix)]

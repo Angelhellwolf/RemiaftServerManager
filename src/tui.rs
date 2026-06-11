@@ -8,7 +8,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent,
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 
-use crate::config::{ConfigStore, RemiaftConfig, ServerConfig};
+use crate::config::{ConfigStore, RconMode, RemiaftConfig, ServerConfig, ServerRuntimeKind};
 use crate::i18n::{self, Language, Text};
 use crate::process;
 
@@ -69,8 +69,13 @@ enum Mode {
     LanguageSelect,
     Normal,
     AddName,
+    AddRuntime,
     AddDir,
     AddStartupCommand,
+    AddDockerImage,
+    AddDockerMount,
+    AddDockerEntrypoint,
+    AddDockerRcon,
     EditDir,
     EditJar,
     EditJavaPath,
@@ -92,6 +97,11 @@ struct Draft {
     name: String,
     dir: String,
     startup_command: String,
+    runtime_kind: ServerRuntimeKind,
+    docker_image: String,
+    docker_mount_server_directory: bool,
+    docker_use_image_entrypoint: bool,
+    docker_rcon_mode: RconMode,
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +165,11 @@ impl App {
                 name: String::new(),
                 dir: String::new(),
                 startup_command: "java -Xms1024M -Xmx4096M -jar server.jar nogui".to_string(),
+                runtime_kind: ServerRuntimeKind::Native,
+                docker_image: String::new(),
+                docker_mount_server_directory: true,
+                docker_use_image_entrypoint: false,
+                docker_rcon_mode: RconMode::Auto,
             },
             status: i18n::text(language, Text::Help).to_string(),
             main_view: MainView::Details,
@@ -316,6 +331,16 @@ impl App {
             Mode::AddName => {
                 self.draft.name = self.input.trim().to_string();
                 self.clear_input();
+                self.mode = Mode::AddRuntime;
+                self.status = self.add_runtime_prompt();
+            }
+            Mode::AddRuntime => {
+                let Some(runtime_kind) = parse_runtime_kind(self.input.trim()) else {
+                    self.status = self.add_runtime_prompt();
+                    return Ok(());
+                };
+                self.draft.runtime_kind = runtime_kind;
+                self.clear_input();
                 self.mode = Mode::AddDir;
                 self.status = self.t(Text::ServerDirPrompt).to_string();
             }
@@ -331,25 +356,48 @@ impl App {
                     "java -Xms1024M -Xmx4096M -jar server.jar nogui",
                 )
                 .to_string();
-                let name = fallback(&self.draft.name, "Minecraft Server").to_string();
-                let dir = PathBuf::from(fallback(&self.draft.dir, "."));
-                let parsed = parse_startup_command(&self.draft.startup_command, &dir);
-                self.config.add_server(
-                    name,
-                    dir,
-                    parsed
-                        .jar_path
-                        .clone()
-                        .unwrap_or_else(|| PathBuf::from("server.jar")),
-                );
-                if let Some(server) = self.config.servers.last_mut() {
-                    apply_startup_command(server, parsed, &self.draft.startup_command);
-                }
-                self.save()?;
-                self.selected = self.config.servers.len().saturating_sub(1);
                 self.clear_input();
-                self.mode = Mode::Normal;
-                self.status = self.t(Text::ServerAdded).to_string();
+                if self.draft.runtime_kind == ServerRuntimeKind::Docker {
+                    self.mode = Mode::AddDockerImage;
+                    self.status = self.add_docker_image_prompt();
+                } else {
+                    self.finish_add_server()?;
+                }
+            }
+            Mode::AddDockerImage => {
+                self.draft.docker_image = self.input.trim().to_string();
+                self.clear_input();
+                self.mode = Mode::AddDockerMount;
+                self.status = self.add_docker_mount_prompt();
+            }
+            Mode::AddDockerMount => {
+                let Some(value) = parse_yes_no(self.input.trim(), true) else {
+                    self.status = self.add_docker_mount_prompt();
+                    return Ok(());
+                };
+                self.draft.docker_mount_server_directory = value;
+                self.clear_input();
+                self.mode = Mode::AddDockerEntrypoint;
+                self.status = self.add_docker_entrypoint_prompt();
+            }
+            Mode::AddDockerEntrypoint => {
+                let Some(value) = parse_yes_no(self.input.trim(), false) else {
+                    self.status = self.add_docker_entrypoint_prompt();
+                    return Ok(());
+                };
+                self.draft.docker_use_image_entrypoint = value;
+                self.clear_input();
+                self.mode = Mode::AddDockerRcon;
+                self.status = self.add_docker_rcon_prompt();
+            }
+            Mode::AddDockerRcon => {
+                let Some(mode) = parse_rcon_mode(self.input.trim()) else {
+                    self.status = self.add_docker_rcon_prompt();
+                    return Ok(());
+                };
+                self.draft.docker_rcon_mode = mode;
+                self.clear_input();
+                self.finish_add_server()?;
             }
             Mode::EditDir => {
                 let directory = PathBuf::from(self.input.trim());
@@ -494,6 +542,92 @@ impl App {
         Ok(())
     }
 
+    fn finish_add_server(&mut self) -> Result<()> {
+        let name = fallback(&self.draft.name, "Minecraft Server").to_string();
+        let dir = PathBuf::from(fallback(&self.draft.dir, "."));
+        let parsed = parse_startup_command(&self.draft.startup_command, &dir);
+        self.config.add_server(
+            name,
+            dir,
+            parsed
+                .jar_path
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("server.jar")),
+        );
+        if let Some(server) = self.config.servers.last_mut() {
+            apply_startup_command(server, parsed, &self.draft.startup_command);
+            server.runtime.kind = self.draft.runtime_kind;
+            if server.runtime.kind == ServerRuntimeKind::Docker {
+                let docker = &mut server.runtime.docker;
+                docker.image = if self.draft.docker_image.trim().is_empty() {
+                    None
+                } else {
+                    Some(self.draft.docker_image.trim().to_string())
+                };
+                docker.mount_server_directory = self.draft.docker_mount_server_directory;
+                docker.use_image_entrypoint = self.draft.docker_use_image_entrypoint;
+                docker.rcon.mode = self.draft.docker_rcon_mode;
+            }
+        }
+        self.save()?;
+        self.selected = self.config.servers.len().saturating_sub(1);
+        self.reset_draft();
+        self.clear_input();
+        self.mode = Mode::Normal;
+        self.status = self.t(Text::ServerAdded).to_string();
+        Ok(())
+    }
+
+    fn reset_draft(&mut self) {
+        self.draft.name.clear();
+        self.draft.dir.clear();
+        self.draft.startup_command = "java -Xms1024M -Xmx4096M -jar server.jar nogui".to_string();
+        self.draft.runtime_kind = ServerRuntimeKind::Native;
+        self.draft.docker_image.clear();
+        self.draft.docker_mount_server_directory = true;
+        self.draft.docker_use_image_entrypoint = false;
+        self.draft.docker_rcon_mode = RconMode::Auto;
+    }
+
+    fn add_runtime_prompt(&self) -> String {
+        match self.language {
+            Language::English => "runtime backend: native/docker; blank uses native:".to_string(),
+            Language::ChineseSimplified => "运行后端：native/docker；留空使用 native：".to_string(),
+        }
+    }
+
+    fn add_docker_image_prompt(&self) -> String {
+        match self.language {
+            Language::English => "Docker image; blank lets remiaft choose Java image:".to_string(),
+            Language::ChineseSimplified => {
+                "Docker 镜像；留空由 remiaft 选择 Java 镜像：".to_string()
+            }
+        }
+    }
+
+    fn add_docker_mount_prompt(&self) -> String {
+        match self.language {
+            Language::English => "bind-mount server directory? yes/no; blank yes:".to_string(),
+            Language::ChineseSimplified => "是否映射服务器目录？yes/no；留空 yes：".to_string(),
+        }
+    }
+
+    fn add_docker_entrypoint_prompt(&self) -> String {
+        match self.language {
+            Language::English => "use image entrypoint? yes/no; blank no:".to_string(),
+            Language::ChineseSimplified => "是否使用镜像入口？yes/no；留空 no：".to_string(),
+        }
+    }
+
+    fn add_docker_rcon_prompt(&self) -> String {
+        match self.language {
+            Language::English => "RCON mode: auto/manual/disabled; blank auto:".to_string(),
+            Language::ChineseSimplified => {
+                "RCON 模式：auto/manual/disabled；留空 auto：".to_string()
+            }
+        }
+    }
+
     fn move_selection(&mut self, delta: isize) {
         let len = self.visible_tree().len();
         if len == 0 {
@@ -628,13 +762,16 @@ impl App {
     }
 
     fn start_selected(&mut self) -> Result<()> {
-        let Some(server) = self.selected().cloned() else {
+        let Some((server_id, server_name)) = self
+            .selected()
+            .map(|server| (server.id.clone(), server.name.clone()))
+        else {
             return Ok(());
         };
-        process::start_supervisor(&self.store, &server)?;
+        process::start_server(&self.store, &mut self.config, &server_id)?;
         self.status = match self.language {
-            Language::English => format!("started {}", server.name),
-            Language::ChineseSimplified => format!("已启动 {}", server.name),
+            Language::English => format!("started {}", server_name),
+            Language::ChineseSimplified => format!("已启动 {}", server_name),
         };
         Ok(())
     }
@@ -652,41 +789,42 @@ impl App {
     }
 
     fn restart_selected(&mut self) -> Result<()> {
-        let Some(server) = self.selected().cloned() else {
+        let Some((server_id, server_name)) = self
+            .selected()
+            .map(|server| (server.id.clone(), server.name.clone()))
+        else {
             return Ok(());
         };
-        process::stop_server(&self.store, &server)?;
-        process::start_supervisor(&self.store, &server)?;
+        process::restart_server(&self.store, &mut self.config, &server_id)?;
         self.status = match self.language {
-            Language::English => format!("restarted {}", server.name),
-            Language::ChineseSimplified => format!("已重启 {}", server.name),
+            Language::English => format!("restarted {}", server_name),
+            Language::ChineseSimplified => format!("已重启 {}", server_name),
         };
         Ok(())
     }
 
     fn restart_targets(&mut self) -> Result<()> {
-        let servers = self.target_servers();
-        for server in &servers {
-            process::stop_server(&self.store, server)?;
-        }
-        for server in &servers {
-            process::start_supervisor(&self.store, server)?;
+        let ids = self.marked_or_selected_server_ids();
+        let count = ids.len();
+        for id in &ids {
+            process::restart_server(&self.store, &mut self.config, id)?;
         }
         self.status = match self.language {
-            Language::English => format!("restarted {} server(s)", servers.len()),
-            Language::ChineseSimplified => format!("已重启 {} 个服务器", servers.len()),
+            Language::English => format!("restarted {count} server(s)"),
+            Language::ChineseSimplified => format!("已重启 {count} 个服务器"),
         };
         Ok(())
     }
 
     fn start_targets(&mut self) -> Result<()> {
-        let servers = self.target_servers();
-        for server in &servers {
-            process::start_supervisor(&self.store, server)?;
+        let ids = self.marked_or_selected_server_ids();
+        let count = ids.len();
+        for id in &ids {
+            process::start_server(&self.store, &mut self.config, id)?;
         }
         self.status = match self.language {
-            Language::English => format!("started {} server(s)", servers.len()),
-            Language::ChineseSimplified => format!("已启动 {} 个服务器", servers.len()),
+            Language::English => format!("started {count} server(s)"),
+            Language::ChineseSimplified => format!("已启动 {count} 个服务器"),
         };
         Ok(())
     }
@@ -1222,6 +1360,32 @@ fn control_char_input(ch: char) -> Option<String> {
         '^' => Some("\u{1e}".to_string()),
         '_' => Some("\u{1f}".to_string()),
         '?' => Some("\u{7f}".to_string()),
+        _ => None,
+    }
+}
+
+fn parse_runtime_kind(input: &str) -> Option<ServerRuntimeKind> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "" | "native" | "n" => Some(ServerRuntimeKind::Native),
+        "docker" | "d" => Some(ServerRuntimeKind::Docker),
+        _ => None,
+    }
+}
+
+fn parse_yes_no(input: &str, default: bool) -> Option<bool> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "" => Some(default),
+        "yes" | "y" | "true" | "1" | "是" => Some(true),
+        "no" | "n" | "false" | "0" | "否" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_rcon_mode(input: &str) -> Option<RconMode> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" | "a" => Some(RconMode::Auto),
+        "manual" | "m" => Some(RconMode::Manual),
+        "disabled" | "disable" | "off" | "d" => Some(RconMode::Disabled),
         _ => None,
     }
 }
