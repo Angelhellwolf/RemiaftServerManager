@@ -589,7 +589,7 @@ fn sanitize_terminal_bytes(input: &[u8]) -> Vec<u8> {
                 output.push(0x7f);
                 index += 1;
             }
-            b'\r' | b'\n' | 0x03 | 0x04 | 0x7f => {
+            b'\r' | b'\n' | b'\t' | 0x03 | 0x04 | 0x7f => {
                 output.push(input[index]);
                 index += 1;
             }
@@ -969,12 +969,12 @@ mod tests {
     }
 
     #[test]
-    fn terminal_input_drops_terminal_editing_keys() {
+    fn terminal_input_drops_escape_editing_keys_but_keeps_tab() {
         assert_eq!(
             sanitize_text(
                 "\u{1b}[A\u{1b}[B\u{1b}[C\u{1b}[D\u{1b}[H\u{1b}[F\u{1b}[3~\u{1}\u{5}\u{15}\t"
             ),
-            ""
+            "\t"
         );
     }
 
