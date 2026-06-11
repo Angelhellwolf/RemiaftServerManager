@@ -5,6 +5,7 @@ mod i18n;
 mod manifest;
 mod process;
 mod rcon;
+mod text_encoding;
 mod tui;
 
 use std::path::PathBuf;

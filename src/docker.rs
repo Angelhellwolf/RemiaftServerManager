@@ -18,6 +18,7 @@ use crate::config::{
 };
 use crate::docker_api::{encode_path, encode_query, DockerClient};
 use crate::rcon;
+use crate::text_encoding;
 
 const DEFAULT_NETWORK: &str = "remiaft";
 const DEFAULT_GAME_PORT: u16 = 25565;
@@ -1017,7 +1018,7 @@ fn allocate_port(start: u16, end: u16, reserved_ports: &[u16]) -> Result<u16> {
 
 fn print_recent_log(store: &ConfigStore, server: &ServerConfig) -> Result<()> {
     let path = minecraft_log_path(store, server);
-    let raw = fs::read_to_string(path).unwrap_or_default();
+    let raw = text_encoding::read_console_text(path).unwrap_or_default();
     let lines = raw.lines().rev().take(40).collect::<Vec<_>>();
     for line in lines.into_iter().rev() {
         println!("{line}");

@@ -3,6 +3,21 @@ use std::path::Path;
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+#[derive(Debug, Default, Clone)]
+pub(super) struct CompletionState {
+    start: usize,
+    end: usize,
+    replacement: String,
+    candidates: Vec<String>,
+    next_index: usize,
+}
+
+impl CompletionState {
+    pub(super) fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 pub(super) fn fallback<'a>(value: &'a str, default: &'a str) -> &'a str {
     if value.trim().is_empty() {
         default
@@ -109,9 +124,15 @@ pub(super) fn complete_input_token(
     input: &mut String,
     cursor: &mut usize,
     directory: &Path,
+    state: &mut CompletionState,
 ) -> bool {
+    if cycle_completion(input, cursor, state) {
+        return true;
+    }
+
     let cursor_pos = (*cursor).min(input.len());
     if !input.is_char_boundary(cursor_pos) {
+        state.reset();
         return false;
     }
     let start = input[..cursor_pos]
@@ -122,35 +143,70 @@ pub(super) fn complete_input_token(
         .unwrap_or(0);
     let prefix = &input[start..cursor_pos];
     if prefix.is_empty() {
+        state.reset();
         return false;
     }
 
     let is_first_token = input[..start].trim().is_empty();
-    let Some(completion) = complete_token(prefix, directory, is_first_token) else {
+    let candidates = completion_candidates(prefix, directory, is_first_token);
+    if candidates.is_empty() {
+        state.reset();
         return false;
+    };
+
+    let (completion, next_index) = match candidates.as_slice() {
+        [candidate] => (candidate.clone(), 0),
+        _ => {
+            let common = longest_common_prefix(&candidates);
+            if common.len() > prefix.len() {
+                (common, 0)
+            } else {
+                (candidates[0].clone(), 1)
+            }
+        }
     };
 
     input.replace_range(start..cursor_pos, &completion);
     *cursor = start + completion.len();
+    *state = CompletionState {
+        start,
+        end: *cursor,
+        replacement: completion,
+        candidates,
+        next_index,
+    };
     true
 }
 
-fn complete_token(prefix: &str, directory: &Path, is_first_token: bool) -> Option<String> {
+fn cycle_completion(input: &mut String, cursor: &mut usize, state: &mut CompletionState) -> bool {
+    if state.candidates.len() < 2
+        || *cursor != state.end
+        || state.end > input.len()
+        || !input.is_char_boundary(state.start)
+        || !input.is_char_boundary(state.end)
+        || input[state.start..state.end] != state.replacement
+    {
+        state.reset();
+        return false;
+    }
+
+    let completion = state.candidates[state.next_index % state.candidates.len()].clone();
+    state.next_index = (state.next_index + 1) % state.candidates.len();
+    input.replace_range(state.start..state.end, &completion);
+    state.end = state.start + completion.len();
+    state.replacement = completion;
+    *cursor = state.end;
+    true
+}
+
+fn completion_candidates(prefix: &str, directory: &Path, is_first_token: bool) -> Vec<String> {
     let mut candidates = path_completion_candidates(prefix, directory);
     if is_first_token && !prefix.contains('/') {
         candidates.extend(path_command_candidates(prefix));
     }
     candidates.sort();
     candidates.dedup();
-
-    match candidates.as_slice() {
-        [] => None,
-        [candidate] => Some(candidate.clone()),
-        _ => {
-            let common = longest_common_prefix(&candidates);
-            (common.len() > prefix.len()).then_some(common)
-        }
-    }
+    candidates
 }
 
 fn path_completion_candidates(prefix: &str, directory: &Path) -> Vec<String> {
@@ -231,10 +287,54 @@ mod tests {
 
         let mut input = "sh sta".to_string();
         let mut cursor = input.len();
+        let mut state = CompletionState::default();
 
-        assert!(complete_input_token(&mut input, &mut cursor, &dir));
+        assert!(complete_input_token(
+            &mut input,
+            &mut cursor,
+            &dir,
+            &mut state
+        ));
         assert_eq!(input, "sh start.sh ");
         assert_eq!(cursor, input.len());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn repeated_tab_cycles_file_candidates() {
+        let dir =
+            std::env::temp_dir().join(format!("remiaft-completion-cycle-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("alpha.jar"), "").unwrap();
+        fs::write(dir.join("alpine.jar"), "").unwrap();
+
+        let mut input = "java -jar al".to_string();
+        let mut cursor = input.len();
+        let mut state = CompletionState::default();
+
+        assert!(complete_input_token(
+            &mut input,
+            &mut cursor,
+            &dir,
+            &mut state
+        ));
+        assert_eq!(input, "java -jar alp");
+        assert!(complete_input_token(
+            &mut input,
+            &mut cursor,
+            &dir,
+            &mut state
+        ));
+        assert_eq!(input, "java -jar alpha.jar ");
+        assert!(complete_input_token(
+            &mut input,
+            &mut cursor,
+            &dir,
+            &mut state
+        ));
+        assert_eq!(input, "java -jar alpine.jar ");
 
         fs::remove_dir_all(&dir).unwrap();
     }

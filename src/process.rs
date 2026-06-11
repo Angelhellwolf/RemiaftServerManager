@@ -18,6 +18,7 @@ use crossterm::terminal::{self, disable_raw_mode, enable_raw_mode, ClearType};
 
 use crate::config::{ConfigStore, RemiaftConfig, ServerConfig, ServerRuntimeKind};
 use crate::docker;
+use crate::text_encoding;
 
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -301,7 +302,8 @@ fn tail_terminal_output(path: PathBuf, mut offset: u64, done: Arc<AtomicBool>) {
                         Ok(0) => break,
                         Ok(n) => {
                             offset = offset.saturating_add(n as u64);
-                            let _ = stdout.write_all(&buf[..n]);
+                            let text = text_encoding::decode_console_bytes(&buf[..n]);
+                            let _ = stdout.write_all(text.as_bytes());
                             let _ = stdout.flush();
                         }
                         Err(_) => break,
@@ -325,7 +327,8 @@ fn replay_terminal_output(path: &Path, offset: u64) -> Result<()> {
         match file.read(&mut buf)? {
             0 => break,
             n => {
-                stdout.write_all(&buf[..n])?;
+                let text = text_encoding::decode_console_bytes(&buf[..n]);
+                stdout.write_all(text.as_bytes())?;
             }
         }
     }
@@ -580,19 +583,13 @@ fn sanitize_terminal_bytes(input: &[u8]) -> Vec<u8> {
         }
         match input[index] {
             0x1b => {
-                if let Some((sequence, consumed)) = read_allowed_input_escape_bytes(&input[index..])
-                {
-                    output.extend_from_slice(sequence);
-                    index += consumed;
-                } else {
-                    index += skip_escape_bytes(&input[index..]).max(1);
-                }
+                index += skip_escape_bytes(&input[index..]).max(1);
             }
             0x08 => {
                 output.push(0x7f);
                 index += 1;
             }
-            b'\r' | b'\n' | b'\t' | 0x01..=0x1a | 0x1c..=0x1f | 0x7f => {
+            b'\r' | b'\n' | 0x03 | 0x04 | 0x7f => {
                 output.push(input[index]);
                 index += 1;
             }
@@ -615,24 +612,6 @@ fn sanitize_terminal_bytes(input: &[u8]) -> Vec<u8> {
 
 pub fn is_allowed_console_char(ch: char) -> bool {
     ch >= ' ' && ch != '\u{7f}' && ch != '\u{a7}' && !ch.is_control()
-}
-
-fn read_allowed_input_escape_bytes(input: &[u8]) -> Option<(&[u8], usize)> {
-    match input {
-        [0x1b, b'[', rest @ ..] => {
-            let end = rest.iter().position(|byte| (b'@'..=b'~').contains(byte))?;
-            let consumed = 2 + end + 1;
-            if consumed > 32 {
-                return None;
-            }
-            let sequence = &input[..consumed];
-            is_allowed_csi_input(sequence).then_some((sequence, consumed))
-        }
-        [0x1b, b'O', ch, ..] if matches!(*ch, b'A'..=b'D' | b'F' | b'H' | b'P'..=b'S') => {
-            Some((&input[..3], 3))
-        }
-        _ => None,
-    }
 }
 
 fn skip_escape_bytes(input: &[u8]) -> usize {
@@ -659,25 +638,6 @@ fn skip_escape_bytes(input: &[u8]) -> usize {
         [0x1b, ..] => input.len().min(2),
         _ => 0,
     }
-}
-
-fn is_allowed_csi_input(sequence: &[u8]) -> bool {
-    let Some(body) = sequence.strip_prefix(b"\x1b[") else {
-        return false;
-    };
-    let Some(final_char) = body.last().copied() else {
-        return false;
-    };
-    if !(b'@'..=b'~').contains(&final_char) {
-        return false;
-    }
-    let prefix_len = body.len().saturating_sub(1);
-    if matches!(final_char, b'M' | b'm') && body.starts_with(b"<") {
-        return false;
-    }
-    body[..prefix_len].iter().all(|byte| {
-        byte.is_ascii_digit() || matches!(*byte, b';' | b'?' | b'>' | b'<' | b':' | b' ')
-    })
 }
 
 #[cfg(unix)]
@@ -1009,12 +969,12 @@ mod tests {
     }
 
     #[test]
-    fn terminal_input_keeps_known_editing_keys() {
+    fn terminal_input_drops_terminal_editing_keys() {
         assert_eq!(
             sanitize_text(
                 "\u{1b}[A\u{1b}[B\u{1b}[C\u{1b}[D\u{1b}[H\u{1b}[F\u{1b}[3~\u{1}\u{5}\u{15}\t"
             ),
-            "\u{1b}[A\u{1b}[B\u{1b}[C\u{1b}[D\u{1b}[H\u{1b}[F\u{1b}[3~\u{1}\u{5}\u{15}\t"
+            ""
         );
     }
 

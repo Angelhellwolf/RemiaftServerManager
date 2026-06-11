@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -11,6 +10,7 @@ use ratatui::text::Line;
 use crate::config::{ConfigStore, RconMode, RemiaftConfig, ServerConfig, ServerRuntimeKind};
 use crate::i18n::{self, Language, Text};
 use crate::process;
+use crate::text_encoding;
 
 mod console_log;
 mod input;
@@ -21,7 +21,7 @@ mod terminal;
 use console_log::{ansi_to_line, wrap_console_lines};
 use input::{
     backspace_at_cursor, complete_input_token, delete_at_cursor, fallback, insert_at_cursor,
-    move_cursor_left, move_cursor_right,
+    move_cursor_left, move_cursor_right, CompletionState,
 };
 use startup::{apply_startup_command, normalize_startup_parts, parse_startup_command, split_args};
 use terminal::TerminalGuard;
@@ -126,6 +126,7 @@ struct App {
     language: Language,
     input: String,
     input_cursor: usize,
+    input_completion: CompletionState,
     draft: Draft,
     status: String,
     main_view: MainView,
@@ -161,6 +162,7 @@ impl App {
             language,
             input: String::new(),
             input_cursor: 0,
+            input_completion: CompletionState::default(),
             draft: Draft {
                 name: String::new(),
                 dir: String::new(),
@@ -1231,7 +1233,7 @@ impl App {
             self.reset_console_for_selection();
         }
         let path = process::minecraft_log_path_for(&self.store, &server);
-        let content = fs::read_to_string(path).unwrap_or_default();
+        let content = text_encoding::read_console_text(path).unwrap_or_default();
         self.console_lines = content.lines().map(ToString::to_string).collect();
         if self.console_lines.len() > 5_000 {
             let keep_from = self.console_lines.len() - 5_000;
@@ -1289,11 +1291,13 @@ impl App {
     fn set_input(&mut self, value: String) {
         self.input = value;
         self.input_cursor = self.input.len();
+        self.input_completion.reset();
     }
 
     fn clear_input(&mut self) {
         self.input.clear();
         self.input_cursor = 0;
+        self.input_completion.reset();
     }
 
     fn complete_prompt_input(&mut self) {
@@ -1305,7 +1309,12 @@ impl App {
             _ => None,
         };
         if let Some(directory) = directory {
-            complete_input_token(&mut self.input, &mut self.input_cursor, &directory);
+            complete_input_token(
+                &mut self.input,
+                &mut self.input_cursor,
+                &directory,
+                &mut self.input_completion,
+            );
         }
     }
 
