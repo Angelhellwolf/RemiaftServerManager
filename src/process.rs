@@ -215,7 +215,7 @@ pub fn attach_terminal(store: &ConfigStore, server: &ServerConfig) -> Result<()>
     )?;
     write!(
         stdout,
-        "\r\n-- remiaft native console: {} --\r\nCtrl-U detach | Ctrl-C interrupt server | terminal scrollback for history\r\n\r\n",
+        "\r\n-- remiaft native console: {} --\r\nCtrl-U detach | Ctrl-C interrupt server | Up/Down command history\r\n\r\n",
         server.name
     )?;
     replay_terminal_output(&minecraft_log_path(store, server), replay_offset)?;
@@ -226,6 +226,7 @@ pub fn attach_terminal(store: &ConfigStore, server: &ServerConfig) -> Result<()>
 
     let mut stdin = io::stdin().lock();
     let mut buf = [0_u8; 1024];
+    let mut input_state = AttachInputState::default();
     loop {
         let read = stdin.read(&mut buf)?;
         if read == 0 {
@@ -234,31 +235,215 @@ pub fn attach_terminal(store: &ConfigStore, server: &ServerConfig) -> Result<()>
         let (cols, rows) = terminal::size().unwrap_or((cols, rows));
         let _ = request_terminal_resize(store, server, rows, cols);
 
-        let mut chunk_start = 0;
-        for index in 0..read {
-            match buf[index] {
-                0x15 => {
-                    append_terminal_bytes(store, server, &buf[chunk_start..index])?;
+        for action in input_state.process(&buf[..read]) {
+            match action {
+                AttachInputAction::Forward(bytes) => {
+                    append_terminal_bytes(store, server, &bytes)?;
+                }
+                AttachInputAction::Detach => {
                     done.store(true, Ordering::Relaxed);
                     let _ = output_thread.join();
                     stdout.write_all(b"\r\n-- detached --\r\n")?;
                     stdout.flush()?;
                     return Ok(());
                 }
-                0x03 => {
-                    append_terminal_bytes(store, server, &buf[chunk_start..index])?;
+                AttachInputAction::Interrupt => {
                     interrupt_server(store, server)?;
-                    chunk_start = index + 1;
                 }
-                _ => {}
             }
         }
-        append_terminal_bytes(store, server, &buf[chunk_start..read])?;
     }
 
     done.store(true, Ordering::Relaxed);
     let _ = output_thread.join();
     Ok(())
+}
+
+#[derive(Default)]
+struct AttachInputState {
+    current_line: Vec<u8>,
+    history: Vec<Vec<u8>>,
+    history_index: Option<usize>,
+    pending_escape: Vec<u8>,
+}
+
+enum AttachInputAction {
+    Forward(Vec<u8>),
+    Detach,
+    Interrupt,
+}
+
+enum AttachEscape {
+    Up,
+    Down,
+    Other,
+}
+
+enum EscapeParse {
+    Complete { len: usize, key: AttachEscape },
+    Incomplete,
+}
+
+impl AttachInputState {
+    fn process(&mut self, input: &[u8]) -> Vec<AttachInputAction> {
+        let mut data = Vec::new();
+        if !self.pending_escape.is_empty() {
+            data.extend_from_slice(&self.pending_escape);
+            self.pending_escape.clear();
+        }
+        data.extend_from_slice(input);
+
+        let mut actions = Vec::new();
+        let mut index = 0;
+        while index < data.len() {
+            if data[index] == 0xc2 && data.get(index + 1) == Some(&0xa7) {
+                index += 2;
+                continue;
+            }
+
+            match data[index] {
+                0x1b => match parse_attach_escape(&data[index..]) {
+                    EscapeParse::Complete { len, key } => {
+                        if let Some(bytes) = self.handle_escape(key) {
+                            actions.push(AttachInputAction::Forward(bytes));
+                        }
+                        index += len;
+                    }
+                    EscapeParse::Incomplete => {
+                        self.pending_escape.extend_from_slice(&data[index..]);
+                        break;
+                    }
+                },
+                0x15 => {
+                    actions.push(AttachInputAction::Detach);
+                    index += 1;
+                }
+                0x03 => {
+                    self.current_line.clear();
+                    self.history_index = None;
+                    actions.push(AttachInputAction::Interrupt);
+                    index += 1;
+                }
+                b'\r' | b'\n' => {
+                    self.commit_current_line();
+                    actions.push(AttachInputAction::Forward(vec![data[index]]));
+                    index += 1;
+                }
+                0x08 | 0x7f => {
+                    self.current_line.pop();
+                    self.history_index = None;
+                    actions.push(AttachInputAction::Forward(vec![data[index]]));
+                    index += 1;
+                }
+                b'\t' => {
+                    self.history_index = None;
+                    actions.push(AttachInputAction::Forward(vec![b'\t']));
+                    index += 1;
+                }
+                0x20..=0x7e | 0x80..=0xff => {
+                    self.current_line.push(data[index]);
+                    self.history_index = None;
+                    actions.push(AttachInputAction::Forward(vec![data[index]]));
+                    index += 1;
+                }
+                0x04 => {
+                    actions.push(AttachInputAction::Forward(vec![data[index]]));
+                    index += 1;
+                }
+                _ => {
+                    index += 1;
+                }
+            }
+        }
+
+        actions
+    }
+
+    fn handle_escape(&mut self, key: AttachEscape) -> Option<Vec<u8>> {
+        match key {
+            AttachEscape::Up => self.recall_history(-1),
+            AttachEscape::Down => self.recall_history(1),
+            AttachEscape::Other => None,
+        }
+    }
+
+    fn recall_history(&mut self, direction: isize) -> Option<Vec<u8>> {
+        if self.history.is_empty() {
+            return None;
+        }
+
+        let next_index = if direction < 0 {
+            Some(
+                self.history_index
+                    .map(|index| index.saturating_sub(1))
+                    .unwrap_or_else(|| self.history.len() - 1),
+            )
+        } else {
+            match self.history_index {
+                Some(index) if index + 1 < self.history.len() => Some(index + 1),
+                Some(_) => None,
+                None => return None,
+            }
+        };
+
+        let next_line = next_index
+            .and_then(|index| self.history.get(index).cloned())
+            .unwrap_or_default();
+        let mut replacement = vec![0x7f; self.current_line.len()];
+        replacement.extend_from_slice(&next_line);
+        self.current_line = next_line;
+        self.history_index = next_index;
+        Some(replacement)
+    }
+
+    fn commit_current_line(&mut self) {
+        let line = std::mem::take(&mut self.current_line);
+        self.history_index = None;
+        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+            return;
+        }
+        if self.history.last().is_some_and(|last| last == &line) {
+            return;
+        }
+        self.history.push(line);
+        if self.history.len() > 100 {
+            self.history.remove(0);
+        }
+    }
+}
+
+fn parse_attach_escape(input: &[u8]) -> EscapeParse {
+    match input {
+        [0x1b] | [0x1b, b'['] | [0x1b, b'O'] => EscapeParse::Incomplete,
+        [0x1b, b'[', rest @ ..] => {
+            let Some(end) = rest.iter().position(|byte| (b'@'..=b'~').contains(byte)) else {
+                return EscapeParse::Incomplete;
+            };
+            let final_char = rest[end];
+            let key = match final_char {
+                b'A' => AttachEscape::Up,
+                b'B' => AttachEscape::Down,
+                _ => AttachEscape::Other,
+            };
+            EscapeParse::Complete { len: end + 3, key }
+        }
+        [0x1b, b'O', ch, ..] => {
+            let key = match ch {
+                b'A' => AttachEscape::Up,
+                b'B' => AttachEscape::Down,
+                _ => AttachEscape::Other,
+            };
+            EscapeParse::Complete { len: 3, key }
+        }
+        [0x1b, ..] => EscapeParse::Complete {
+            len: skip_escape_bytes(input).max(1),
+            key: AttachEscape::Other,
+        },
+        _ => EscapeParse::Complete {
+            len: 0,
+            key: AttachEscape::Other,
+        },
+    }
 }
 
 fn append_terminal_bytes(store: &ConfigStore, server: &ServerConfig, bytes: &[u8]) -> Result<()> {
@@ -963,6 +1148,18 @@ mod tests {
         String::from_utf8_lossy(&sanitize_terminal_bytes(input.as_bytes())).into_owned()
     }
 
+    fn forward_text(actions: Vec<AttachInputAction>) -> String {
+        let bytes = actions
+            .into_iter()
+            .filter_map(|action| match action {
+                AttachInputAction::Forward(bytes) => Some(bytes),
+                AttachInputAction::Detach | AttachInputAction::Interrupt => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
     #[test]
     fn terminal_input_normalizes_backspace_to_delete() {
         assert_eq!(sanitize_text("sa\u{8}y\r"), "sa\u{7f}y\r");
@@ -991,6 +1188,27 @@ mod tests {
         assert_eq!(
             sanitize_text("say \u{a7}red\u{1b}bad\u{7f}\r"),
             "say redad\u{7f}\r"
+        );
+    }
+
+    #[test]
+    fn attach_input_up_and_down_recall_command_history() {
+        let mut state = AttachInputState::default();
+
+        assert_eq!(forward_text(state.process(b"say one\r")), "say one\r");
+        assert_eq!(forward_text(state.process(b"say two\r")), "say two\r");
+        assert_eq!(forward_text(state.process(b"\x1b[A")), "say two");
+        assert_eq!(
+            forward_text(state.process(b"\x1b[A")),
+            "\u{7f}\u{7f}\u{7f}\u{7f}\u{7f}\u{7f}\u{7f}say one"
+        );
+        assert_eq!(
+            forward_text(state.process(b"\x1b[B")),
+            "\u{7f}\u{7f}\u{7f}\u{7f}\u{7f}\u{7f}\u{7f}say two"
+        );
+        assert_eq!(
+            forward_text(state.process(b"\x1b[B")),
+            "\u{7f}\u{7f}\u{7f}\u{7f}\u{7f}\u{7f}\u{7f}"
         );
     }
 }
