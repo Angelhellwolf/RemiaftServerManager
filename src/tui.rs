@@ -1,6 +1,9 @@
-use std::collections::HashSet;
-use std::fs;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File};
+use std::io::{Read as _, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -11,6 +14,7 @@ use ratatui::text::Line;
 use crate::config::{ConfigStore, RemiaftConfig, ServerConfig};
 use crate::i18n::{self, Language, Text};
 use crate::process;
+use crate::shutdown;
 
 mod console_log;
 mod input;
@@ -20,20 +24,30 @@ mod terminal;
 
 use console_log::{ansi_to_line, wrap_console_lines};
 use input::{
-    backspace_at_cursor, complete_input_token, delete_at_cursor, fallback, insert_at_cursor,
-    move_cursor_left, move_cursor_right,
+    apply_candidate, backspace_at_cursor, complete_input_token, delete_at_cursor, fallback,
+    insert_at_cursor, move_cursor_left, move_cursor_right, Completion,
 };
 use startup::{apply_startup_command, normalize_startup_parts, parse_startup_command, split_args};
 use terminal::TerminalGuard;
+
+/// Keep at most this many raw log lines in memory for the embedded log panel.
+const MAX_CONSOLE_LINES: usize = 2_000;
+/// Only read the tail of the server log; the embedded panel never shows more.
+const LOG_TAIL_BYTES: u64 = 512 * 1024;
 
 pub async fn run(store: ConfigStore) -> Result<()> {
     let mut terminal = TerminalGuard::enter()?;
     let mut app = App::new(store)?;
 
     loop {
+        if shutdown::requested() {
+            break;
+        }
+        app.drain_op_messages();
         app.refresh_console();
         let size = terminal.size()?;
         app.update_console_layout(size);
+        app.ensure_wrapped();
         if app.take_screen_clear() {
             terminal.clear()?;
         }
@@ -41,7 +55,7 @@ pub async fn run(store: ConfigStore) -> Result<()> {
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
                 Event::Key(key) => {
-                    if app.handle_key(key).await? {
+                    if app.handle_key(key)? {
                         break;
                     }
                 }
@@ -82,16 +96,40 @@ enum Mode {
     Command,
 }
 
+/// Lifecycle operation currently running for a server in a background
+/// thread. Stopping can legitimately take up to 30 seconds (graceful stop,
+/// then kill), so it must never run on the UI thread.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum MainView {
-    Details,
-    Console,
+pub(crate) enum PendingOp {
+    Start,
+    Stop,
+    Restart,
+}
+
+/// State shared between the UI thread and lifecycle worker threads.
+#[derive(Default)]
+struct OpsShared {
+    /// server id -> operation in flight.
+    pending: Mutex<HashMap<String, PendingOp>>,
+    /// Completion/error messages produced by worker threads, drained into
+    /// the status line by the UI loop.
+    messages: Mutex<Vec<String>>,
 }
 
 struct Draft {
     name: String,
     dir: String,
     startup_command: String,
+}
+
+/// Tab-cycle state for an ambiguous prompt completion: `start` is the byte
+/// offset in `App::input` where the completed token begins, and `index`
+/// tracks which `candidates` entry is currently filled in so the next Tab
+/// (or Shift-Tab) press can swap it for the next (or previous) one in place.
+struct PromptCompletion {
+    start: usize,
+    candidates: Vec<String>,
+    index: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -118,16 +156,20 @@ struct App {
     input_cursor: usize,
     draft: Draft,
     status: String,
-    main_view: MainView,
     show_details: bool,
-    detail_scroll: u16,
+    show_help: bool,
     console_server_id: Option<String>,
     console_lines: Vec<String>,
+    console_wrapped: Vec<String>,
+    console_dirty: bool,
+    console_last_len: Option<u64>,
     console_end: Option<usize>,
     console_follow: bool,
     console_wrap_width: usize,
     console_attach_request: Option<ServerConfig>,
     needs_screen_clear: bool,
+    completion: Option<PromptCompletion>,
+    ops: Arc<OpsShared>,
 }
 
 impl App {
@@ -157,40 +199,41 @@ impl App {
                 startup_command: "java -Xms1024M -Xmx4096M -jar server.jar nogui".to_string(),
             },
             status: i18n::text(language, Text::Help).to_string(),
-            main_view: MainView::Details,
             show_details: true,
-            detail_scroll: 0,
+            show_help: false,
             console_server_id: None,
             console_lines: Vec::new(),
+            console_wrapped: Vec::new(),
+            console_dirty: false,
+            console_last_len: None,
             console_end: None,
             console_follow: true,
             console_wrap_width: 120,
             console_attach_request: None,
             needs_screen_clear: false,
+            completion: None,
+            ops: Arc::new(OpsShared::default()),
         })
     }
 
-    async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+    fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.show_help {
+            self.show_help = false;
+            return Ok(false);
+        }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            if matches!(self.mode, Mode::Normal) && self.main_view == MainView::Console {
-                self.interrupt_console_server()?;
-                return Ok(false);
-            }
             return Ok(true);
         }
 
         match self.mode {
             Mode::LanguageSelect => self.handle_language_key(key),
-            Mode::Normal if self.main_view == MainView::Console => {
-                self.handle_console_key(key).await
-            }
-            Mode::Normal => self.handle_normal_key(key).await,
+            Mode::Normal => self.handle_normal_key(key),
             _ => self.handle_input_key(key),
         }
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
-        if !matches!(self.mode, Mode::Normal) || self.main_view != MainView::Console {
+        if !matches!(self.mode, Mode::Normal) {
             return;
         }
         match mouse.kind {
@@ -214,32 +257,32 @@ impl App {
         Ok(false)
     }
 
-    async fn handle_normal_key(&mut self, key: KeyEvent) -> Result<bool> {
+    fn handle_normal_key(&mut self, key: KeyEvent) -> Result<bool> {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+            KeyCode::Char('?') | KeyCode::F(1) => self.show_help = true,
             KeyCode::F(2) => self.begin_add_group(),
             KeyCode::F(3) => self.begin_move_to_group(),
-            KeyCode::F(5) => self.start_targets()?,
-            KeyCode::F(6) => self.stop_targets()?,
-            KeyCode::F(7) => self.restart_targets()?,
-            KeyCode::Down if self.main_view == MainView::Console => self.scroll_console(1),
-            KeyCode::Up if self.main_view == MainView::Console => self.scroll_console(-1),
+            KeyCode::F(5) => self.start_targets(),
+            KeyCode::F(6) => self.stop_targets(),
+            KeyCode::F(7) => self.restart_targets(),
             KeyCode::Down => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Left => self.collapse_selected_group(),
             KeyCode::Right => self.expand_selected_group(),
             KeyCode::Enter => self.toggle_mark_selected(),
-            KeyCode::PageUp if self.main_view == MainView::Details => self.scroll_detail(-6),
-            KeyCode::PageDown if self.main_view == MainView::Details => self.scroll_detail(6),
+            KeyCode::PageUp => self.scroll_console(-10),
+            KeyCode::PageDown => self.scroll_console(10),
+            KeyCode::End => self.follow_console(),
             KeyCode::Char('n') => {
                 self.mode = Mode::AddName;
                 self.clear_input();
                 self.status = self.t(Text::ServerNamePrompt).to_string();
             }
             KeyCode::Char('d') => self.delete_selected()?,
-            KeyCode::Char('s') => self.start_selected()?,
-            KeyCode::Char('x') => self.stop_selected()?,
-            KeyCode::Char('r') => self.restart_selected()?,
+            KeyCode::Char('s') => self.start_selected(),
+            KeyCode::Char('x') => self.stop_selected(),
+            KeyCode::Char('r') => self.restart_selected(),
             KeyCode::Char('a') => self.toggle_auto_restart()?,
             KeyCode::Char('m') => self.begin_move_to_group(),
             KeyCode::Char('p') => self.begin_edit_dir(),
@@ -248,13 +291,9 @@ impl App {
             KeyCode::Char('y') => self.begin_edit_java_path(),
             KeyCode::Char('e') => self.begin_edit_java_args(),
             KeyCode::Char('g') => self.begin_edit_server_args(),
-            KeyCode::Char('c') => self.begin_command(),
-            KeyCode::Char('i') => self.begin_command(),
-            KeyCode::Char('o') => self.toggle_console(),
+            KeyCode::Char('c') | KeyCode::Char('i') => self.begin_command(),
+            KeyCode::Char('o') => self.request_console_attach(),
             KeyCode::Char('b') => self.toggle_details(),
-            KeyCode::End => self.follow_console(),
-            KeyCode::PageUp => self.scroll_console_page(-1),
-            KeyCode::PageDown => self.scroll_console_page(1),
             KeyCode::Char('l') => {
                 self.mode = Mode::LanguageSelect;
                 self.status = i18n::text(self.language, Text::LanguagePromptHint).to_string();
@@ -264,24 +303,10 @@ impl App {
         Ok(false)
     }
 
-    async fn handle_console_key(&mut self, key: KeyEvent) -> Result<bool> {
-        match key.code {
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.leave_console();
-            }
-            KeyCode::PageUp => self.scroll_console_page(-1),
-            KeyCode::PageDown => self.scroll_console_page(1),
-            _ => {
-                if let Some(input) = self.console_key_input(key) {
-                    self.send_console_terminal_input(&input)?;
-                    self.follow_console();
-                }
-            }
-        }
-        Ok(false)
-    }
-
     fn handle_input_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if !matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.completion = None;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
@@ -293,7 +318,8 @@ impl App {
             KeyCode::Right => move_cursor_right(&self.input, &mut self.input_cursor),
             KeyCode::Up | KeyCode::Home => self.input_cursor = 0,
             KeyCode::Down | KeyCode::End => self.input_cursor = self.input.len(),
-            KeyCode::Tab => self.complete_prompt_input(),
+            KeyCode::Tab => self.complete_prompt_input(false),
+            KeyCode::BackTab => self.complete_prompt_input(true),
             KeyCode::Delete => delete_at_cursor(&mut self.input, self.input_cursor),
             KeyCode::Backspace | KeyCode::Char('h')
                 if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -502,10 +528,6 @@ impl App {
         }
         let next = self.selected as isize + delta;
         self.selected = next.clamp(0, len.saturating_sub(1) as isize) as usize;
-        if self.main_view == MainView::Console {
-            self.reset_console_for_selection();
-        }
-        self.detail_scroll = 0;
     }
 
     fn selected(&self) -> Option<&crate::config::ServerConfig> {
@@ -627,80 +649,99 @@ impl App {
         Ok(())
     }
 
-    fn start_selected(&mut self) -> Result<()> {
-        let Some(server) = self.selected().cloned() else {
-            return Ok(());
-        };
-        process::start_supervisor(&self.store, &server)?;
-        self.status = match self.language {
-            Language::English => format!("started {}", server.name),
-            Language::ChineseSimplified => format!("已启动 {}", server.name),
-        };
-        Ok(())
+    fn start_selected(&mut self) {
+        if let Some(server) = self.selected().cloned() {
+            self.queue_op(vec![server], PendingOp::Start);
+        }
     }
 
-    fn stop_selected(&mut self) -> Result<()> {
-        let Some(server) = self.selected().cloned() else {
-            return Ok(());
-        };
-        process::stop_server(&self.store, &server)?;
-        self.status = match self.language {
-            Language::English => format!("stopped {}", server.name),
-            Language::ChineseSimplified => format!("已停止 {}", server.name),
-        };
-        Ok(())
+    fn stop_selected(&mut self) {
+        if let Some(server) = self.selected().cloned() {
+            self.queue_op(vec![server], PendingOp::Stop);
+        }
     }
 
-    fn restart_selected(&mut self) -> Result<()> {
-        let Some(server) = self.selected().cloned() else {
-            return Ok(());
-        };
-        process::stop_server(&self.store, &server)?;
-        process::start_supervisor(&self.store, &server)?;
-        self.status = match self.language {
-            Language::English => format!("restarted {}", server.name),
-            Language::ChineseSimplified => format!("已重启 {}", server.name),
-        };
-        Ok(())
+    fn restart_selected(&mut self) {
+        if let Some(server) = self.selected().cloned() {
+            self.queue_op(vec![server], PendingOp::Restart);
+        }
     }
 
-    fn restart_targets(&mut self) -> Result<()> {
+    fn start_targets(&mut self) {
         let servers = self.target_servers();
-        for server in &servers {
-            process::stop_server(&self.store, server)?;
-        }
-        for server in &servers {
-            process::start_supervisor(&self.store, server)?;
-        }
-        self.status = match self.language {
-            Language::English => format!("restarted {} server(s)", servers.len()),
-            Language::ChineseSimplified => format!("已重启 {} 个服务器", servers.len()),
-        };
-        Ok(())
+        self.queue_op(servers, PendingOp::Start);
     }
 
-    fn start_targets(&mut self) -> Result<()> {
+    fn stop_targets(&mut self) {
         let servers = self.target_servers();
-        for server in &servers {
-            process::start_supervisor(&self.store, server)?;
-        }
-        self.status = match self.language {
-            Language::English => format!("started {} server(s)", servers.len()),
-            Language::ChineseSimplified => format!("已启动 {} 个服务器", servers.len()),
-        };
-        Ok(())
+        self.queue_op(servers, PendingOp::Stop);
     }
 
-    fn stop_targets(&mut self) -> Result<()> {
+    fn restart_targets(&mut self) {
         let servers = self.target_servers();
-        for server in &servers {
-            process::stop_server(&self.store, server)?;
-        }
-        self.status = match self.language {
-            Language::English => format!("stopped {} server(s)", servers.len()),
-            Language::ChineseSimplified => format!("已停止 {} 个服务器", servers.len()),
+        self.queue_op(servers, PendingOp::Restart);
+    }
+
+    /// Runs a lifecycle operation on a worker thread. `stop_server` can block
+    /// for up to 30 seconds waiting for a graceful shutdown, which used to
+    /// freeze the whole UI; the pending map lets the tree show a transient
+    /// "stopping..." state instead.
+    fn queue_op(&mut self, servers: Vec<ServerConfig>, op: PendingOp) {
+        let servers: Vec<ServerConfig> = {
+            let pending = self.ops.pending.lock().expect("ops lock");
+            servers
+                .into_iter()
+                .filter(|server| !pending.contains_key(&server.id))
+                .collect()
         };
-        Ok(())
+        if servers.is_empty() {
+            return;
+        }
+        {
+            let mut pending = self.ops.pending.lock().expect("ops lock");
+            for server in &servers {
+                pending.insert(server.id.clone(), op);
+            }
+        }
+
+        self.status = op_progress_message(self.language, op, &servers);
+
+        let ops = Arc::clone(&self.ops);
+        let store = self.store.clone();
+        let language = self.language;
+        thread::spawn(move || {
+            for server in servers {
+                let result = match op {
+                    PendingOp::Start => process::start_supervisor(&store, &server),
+                    PendingOp::Stop => process::stop_server(&store, &server),
+                    PendingOp::Restart => process::stop_server(&store, &server)
+                        .and_then(|_| process::start_supervisor(&store, &server)),
+                };
+                ops.pending.lock().expect("ops lock").remove(&server.id);
+                let message = match result {
+                    Ok(()) => op_done_message(language, op, &server.name),
+                    Err(err) => format!("{}: {err}", server.name),
+                };
+                ops.messages.lock().expect("ops lock").push(message);
+            }
+        });
+    }
+
+    fn drain_op_messages(&mut self) {
+        let mut messages = self.ops.messages.lock().expect("ops lock");
+        if let Some(last) = messages.pop() {
+            self.status = last;
+        }
+        messages.clear();
+    }
+
+    fn pending_op(&self, server_id: &str) -> Option<PendingOp> {
+        self.ops
+            .pending
+            .lock()
+            .expect("ops lock")
+            .get(server_id)
+            .copied()
     }
 
     fn target_servers(&self) -> Vec<crate::config::ServerConfig> {
@@ -814,16 +855,6 @@ impl App {
         }
     }
 
-    fn scroll_detail(&mut self, delta: isize) {
-        if delta < 0 {
-            self.detail_scroll = self
-                .detail_scroll
-                .saturating_sub(delta.unsigned_abs() as u16);
-        } else {
-            self.detail_scroll = self.detail_scroll.saturating_add(delta as u16);
-        }
-    }
-
     fn begin_add_group(&mut self) {
         self.clear_input();
         self.mode = Mode::AddGroup;
@@ -907,85 +938,12 @@ impl App {
         }
     }
 
-    fn interrupt_console_server(&mut self) -> Result<()> {
-        let Some(server) = self.selected().cloned() else {
-            return Ok(());
-        };
-        if process::runtime_status(&self.store, &server) != process::RuntimeStatus::Running {
-            return Ok(());
-        }
-        process::interrupt_server(&self.store, &server)?;
-        self.console_follow = true;
-        self.console_end = None;
-        self.status = match self.language {
-            Language::English => format!("sent Ctrl-C to {}", server.name),
-            Language::ChineseSimplified => format!("已向 {} 发送 Ctrl-C", server.name),
-        };
-        Ok(())
-    }
-
-    fn send_console_terminal_input(&self, input: &str) -> Result<bool> {
-        let Some(server) = self
-            .selected()
-            .filter(|server| {
-                process::runtime_status(&self.store, server) == process::RuntimeStatus::Running
-            })
-            .cloned()
-        else {
-            return Ok(false);
-        };
-        process::append_terminal_input(&self.store, &server, input)?;
-        Ok(true)
-    }
-
-    fn console_key_input(&self, key: KeyEvent) -> Option<String> {
-        let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
-        match key.code {
-            KeyCode::Backspace => Some("\u{7f}".to_string()),
-            KeyCode::Enter => Some("\r".to_string()),
-            KeyCode::Left => Some(self.cursor_key_input('D')),
-            KeyCode::Right => Some(self.cursor_key_input('C')),
-            KeyCode::Up => Some(self.cursor_key_input('A')),
-            KeyCode::Down => Some(self.cursor_key_input('B')),
-            KeyCode::Home => Some("\u{1b}[H".to_string()),
-            KeyCode::End => Some("\u{1b}[F".to_string()),
-            KeyCode::Delete => Some("\u{1b}[3~".to_string()),
-            KeyCode::Insert => Some("\u{1b}[2~".to_string()),
-            KeyCode::Tab => Some("\t".to_string()),
-            KeyCode::BackTab => Some("\u{1b}[Z".to_string()),
-            KeyCode::Esc => Some("\u{1b}".to_string()),
-            KeyCode::Char(ch) if control => control_char_input(ch),
-            KeyCode::Char(ch)
-                if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT || alt)
-                    && process::is_allowed_console_char(ch) =>
-            {
-                let mut encoded = [0; 4];
-                let input = ch.encode_utf8(&mut encoded);
-                if alt {
-                    Some(format!("\u{1b}{input}"))
-                } else {
-                    Some(input.to_string())
-                }
-            }
-            _ => None,
-        }
-    }
-
-    fn cursor_key_input(&self, suffix: char) -> String {
-        format!("\u{1b}[{suffix}")
-    }
-
     fn queue_screen_clear(&mut self) {
         self.needs_screen_clear = true;
     }
 
     fn take_screen_clear(&mut self) -> bool {
         std::mem::take(&mut self.needs_screen_clear)
-    }
-
-    fn toggle_console(&mut self) {
-        self.request_console_attach();
     }
 
     fn request_console_attach(&mut self) {
@@ -1006,12 +964,6 @@ impl App {
         self.console_attach_request.take()
     }
 
-    fn leave_console(&mut self) {
-        self.main_view = MainView::Details;
-        self.queue_screen_clear();
-        self.status = self.t(Text::Help).to_string();
-    }
-
     fn toggle_details(&mut self) {
         self.show_details = !self.show_details;
         if self.show_details {
@@ -1022,38 +974,25 @@ impl App {
     }
 
     fn follow_console(&mut self) {
-        if self.main_view == MainView::Console {
-            self.console_follow = true;
-            self.console_end = None;
-            self.status = self.t(Text::ConsoleFollow).to_string();
-        }
-    }
-
-    fn scroll_console_page(&mut self, direction: isize) {
-        if self.main_view != MainView::Console {
-            return;
-        }
-        let delta = if direction < 0 { -10 } else { 10 };
-        self.scroll_console(delta);
+        self.console_follow = true;
+        self.console_end = None;
     }
 
     fn scroll_console(&mut self, delta: isize) {
-        if self.main_view != MainView::Console {
+        let visual_len = self.console_wrapped.len();
+        if visual_len == 0 {
             return;
         }
-        let visual_len = self.console_visual_len();
         if delta < 0 {
             let end = self.console_end.unwrap_or(visual_len);
             self.console_end = Some(end.saturating_sub(delta.unsigned_abs()).max(1));
             self.console_follow = false;
-            self.status = self.t(Text::ConsolePaused).to_string();
         } else {
             let end = self.console_end.unwrap_or(visual_len);
             let next = end.saturating_add(delta as usize).min(visual_len);
             if next >= visual_len {
                 self.console_follow = true;
                 self.console_end = None;
-                self.status = self.t(Text::ConsoleFollow).to_string();
             } else {
                 self.console_end = Some(next.max(1));
             }
@@ -1063,6 +1002,9 @@ impl App {
     fn reset_console_for_selection(&mut self) {
         self.console_server_id = self.selected().map(|server| server.id.clone());
         self.console_lines.clear();
+        self.console_wrapped.clear();
+        self.console_last_len = None;
+        self.console_dirty = true;
         self.console_end = None;
         self.console_follow = true;
     }
@@ -1071,68 +1013,77 @@ impl App {
         let width = width.max(1);
         if self.console_wrap_width != width {
             self.console_wrap_width = width;
-            if !self.console_follow {
-                let visual_len = self.console_visual_len();
-                self.console_end = self.console_end.map(|end| end.min(visual_len).max(1));
-            }
+            self.console_dirty = true;
         }
     }
 
-    fn console_visual_len(&self) -> usize {
-        wrap_console_lines(&self.console_lines, self.console_wrap_width)
-            .len()
-            .max(self.console_lines.len().min(1))
-    }
-
+    /// Re-reads the tail of the selected server's log, but only when the
+    /// file actually grew or the selection changed. Reading the whole file
+    /// on every 200ms tick used to make the UI crawl once logs got large.
     fn refresh_console(&mut self) {
         let Some(server) = self.selected().cloned() else {
-            self.console_lines.clear();
+            if !self.console_lines.is_empty() {
+                self.console_lines.clear();
+                self.console_dirty = true;
+            }
+            self.console_server_id = None;
+            self.console_last_len = None;
             return;
         };
         if self.console_server_id.as_deref() != Some(server.id.as_str()) {
             self.reset_console_for_selection();
         }
         let path = process::minecraft_log_path_for(&self.store, &server);
-        let content = fs::read_to_string(path).unwrap_or_default();
-        self.console_lines = content.lines().map(ToString::to_string).collect();
-        if self.console_lines.len() > 5_000 {
-            let keep_from = self.console_lines.len() - 5_000;
-            self.console_lines.drain(..keep_from);
-            if let Some(end) = self.console_end {
-                self.console_end = Some(end.saturating_sub(keep_from).max(1));
-            }
+        let len = fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if self.console_last_len == Some(len) {
+            return;
         }
+        self.console_last_len = Some(len);
+        let content = read_log_tail(&path, LOG_TAIL_BYTES).unwrap_or_default();
+        self.console_lines = content.lines().map(ToString::to_string).collect();
+        if self.console_lines.len() > MAX_CONSOLE_LINES {
+            let keep_from = self.console_lines.len() - MAX_CONSOLE_LINES;
+            self.console_lines.drain(..keep_from);
+        }
+        self.console_dirty = true;
+    }
+
+    /// Rewraps the cached log lines when the content or panel width changed.
+    /// Wrapping thousands of lines is too expensive to redo on every frame.
+    fn ensure_wrapped(&mut self) {
+        if !self.console_dirty {
+            return;
+        }
+        self.console_wrapped = wrap_console_lines(&self.console_lines, self.console_wrap_width);
+        self.console_dirty = false;
         if self.console_follow {
             self.console_end = None;
         } else {
-            let len = self.console_visual_len();
+            let len = self.console_wrapped.len();
             self.console_end = self.console_end.map(|end| end.min(len).max(1));
         }
     }
 
-    fn console_visible_lines(&self, height: usize, width: usize) -> Vec<Line<'static>> {
-        if self.console_lines.is_empty() {
+    fn console_visible_lines(&self, height: usize) -> Vec<Line<'static>> {
+        if self.console_wrapped.is_empty() {
             return vec![Line::from(self.t(Text::ConsoleEmpty).to_string())];
         }
 
-        let wrapped_lines = wrap_console_lines(&self.console_lines, width.max(1));
         let end = if self.console_follow {
-            wrapped_lines.len()
+            self.console_wrapped.len()
         } else {
             self.console_end
-                .unwrap_or(wrapped_lines.len())
-                .min(wrapped_lines.len())
+                .unwrap_or(self.console_wrapped.len())
+                .min(self.console_wrapped.len())
                 .max(1)
         };
         let start = end.saturating_sub(height);
-        wrapped_lines[start..end]
+        self.console_wrapped[start..end]
             .iter()
             .map(|line| ansi_to_line(line))
             .collect()
-    }
-
-    fn console_cursor_position(&self) -> Option<(u16, u16)> {
-        None
     }
 
     fn set_language(&mut self, language: Language) -> Result<()> {
@@ -1151,14 +1102,21 @@ impl App {
     fn set_input(&mut self, value: String) {
         self.input = value;
         self.input_cursor = self.input.len();
+        self.completion = None;
     }
 
     fn clear_input(&mut self) {
         self.input.clear();
         self.input_cursor = 0;
+        self.completion = None;
     }
 
-    fn complete_prompt_input(&mut self) {
+    fn complete_prompt_input(&mut self, reverse: bool) {
+        if self.cycle_prompt_completion(reverse) {
+            return;
+        }
+        self.completion = None;
+
         let directory = match self.mode {
             Mode::Command | Mode::EditStartupCommand => {
                 self.selected().map(|server| server.directory.clone())
@@ -1166,36 +1124,62 @@ impl App {
             Mode::AddStartupCommand => Some(PathBuf::from(self.draft.dir.trim())),
             _ => None,
         };
-        if let Some(directory) = directory {
-            complete_input_token(&mut self.input, &mut self.input_cursor, &directory);
+        let Some(directory) = directory else {
+            return;
+        };
+
+        match complete_input_token(&mut self.input, &mut self.input_cursor, &directory) {
+            Completion::None | Completion::Applied => {}
+            Completion::Ambiguous { start, candidates } => {
+                self.status = candidate_status_message(self.language, &candidates);
+                self.completion = Some(PromptCompletion {
+                    start,
+                    candidates,
+                    index: 0,
+                });
+            }
         }
     }
 
-    fn update_console_layout(&mut self, area: Rect) {
-        if self.main_view != MainView::Console {
-            return;
-        }
-        let header_height = if area.height >= 8 { 3 } else { 1 };
-        let footer_height = if area.height >= 10 { 3 } else { 1 };
-        let body_height = area
-            .height
-            .saturating_sub(header_height)
-            .saturating_sub(footer_height);
-        let console_header_height = if body_height < 6 {
-            0
-        } else if body_height >= 12 {
-            5
-        } else if body_height >= 8 {
-            3
-        } else {
-            0
+    /// If a Tab-cycle is already active for the token that was last
+    /// completed, swap in the next (or, cycling backwards for Shift-Tab,
+    /// previous) candidate in place and report `true`. Returns `false` when
+    /// there's no active cycle, or the input changed underneath it, so the
+    /// caller falls back to starting a fresh completion.
+    fn cycle_prompt_completion(&mut self, reverse: bool) -> bool {
+        let Some(completion) = &self.completion else {
+            return false;
         };
-        let log_height = body_height.saturating_sub(console_header_height);
-        let bordered = log_height >= 3 && area.width >= 4;
-        let width = if bordered {
-            area.width.saturating_sub(2).max(1)
+        let current = completion.candidates[completion.index].clone();
+        let start = completion.start;
+        let end = start + current.len();
+        if end > self.input.len() || self.input[start..end] != current {
+            return false;
+        }
+
+        let completion = self.completion.as_mut().expect("checked above");
+        let len = completion.candidates.len();
+        completion.index = if reverse {
+            (completion.index + len - 1) % len
         } else {
-            area.width.max(1)
+            (completion.index + 1) % len
+        };
+        let next = completion.candidates[completion.index].clone();
+        let candidates = completion.candidates.clone();
+
+        apply_candidate(&mut self.input, &mut self.input_cursor, start, end, &next);
+        self.status = candidate_status_message(self.language, &candidates);
+        true
+    }
+
+    fn update_console_layout(&mut self, area: Rect) {
+        let regions = render::compute_regions(area, self.show_details);
+        let log = regions.log;
+        let bordered = log.height >= 3 && log.width >= 4;
+        let width = if bordered {
+            log.width.saturating_sub(2).max(1)
+        } else {
+            log.width.max(1)
         };
         self.set_console_wrap_width(width as usize);
     }
@@ -1209,19 +1193,72 @@ impl App {
     }
 }
 
-fn control_char_input(ch: char) -> Option<String> {
-    let lower = ch.to_ascii_lowercase();
-    if lower.is_ascii_lowercase() {
-        let code = lower as u8 - b'a' + 1;
-        return Some((code as char).to_string());
+/// Reads up to `tail_bytes` from the end of `path`, dropping a leading
+/// partial line when the read did not start at the beginning of the file.
+fn read_log_tail(path: &Path, tail_bytes: u64) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let offset = len.saturating_sub(tail_bytes);
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?;
+    let mut content = String::from_utf8_lossy(&buf).into_owned();
+    if offset > 0 {
+        if let Some(newline) = content.find('\n') {
+            content.drain(..=newline);
+        }
     }
-    match ch {
-        '[' => Some("\u{1b}".to_string()),
-        '\\' => Some("\u{1c}".to_string()),
-        ']' => Some("\u{1d}".to_string()),
-        '^' => Some("\u{1e}".to_string()),
-        '_' => Some("\u{1f}".to_string()),
-        '?' => Some("\u{7f}".to_string()),
-        _ => None,
+    Some(content)
+}
+
+fn op_progress_message(language: Language, op: PendingOp, servers: &[ServerConfig]) -> String {
+    let names = servers
+        .iter()
+        .map(|server| server.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    match (language, op) {
+        (Language::English, PendingOp::Start) => format!("starting {names}"),
+        (Language::English, PendingOp::Stop) => format!("stopping {names}"),
+        (Language::English, PendingOp::Restart) => format!("restarting {names}"),
+        (Language::ChineseSimplified, PendingOp::Start) => format!("正在启动 {names}"),
+        (Language::ChineseSimplified, PendingOp::Stop) => format!("正在停止 {names}"),
+        (Language::ChineseSimplified, PendingOp::Restart) => format!("正在重启 {names}"),
+    }
+}
+
+fn op_done_message(language: Language, op: PendingOp, name: &str) -> String {
+    match (language, op) {
+        (Language::English, PendingOp::Start) => format!("started {name}"),
+        (Language::English, PendingOp::Stop) => format!("stopped {name}"),
+        (Language::English, PendingOp::Restart) => format!("restarted {name}"),
+        (Language::ChineseSimplified, PendingOp::Start) => format!("已启动 {name}"),
+        (Language::ChineseSimplified, PendingOp::Stop) => format!("已停止 {name}"),
+        (Language::ChineseSimplified, PendingOp::Restart) => format!("已重启 {name}"),
+    }
+}
+
+fn candidate_status_message(language: Language, candidates: &[String]) -> String {
+    const MAX_SHOWN: usize = 6;
+    let mut list = candidates
+        .iter()
+        .take(MAX_SHOWN)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("  ");
+    if candidates.len() > MAX_SHOWN {
+        let more = candidates.len() - MAX_SHOWN;
+        list.push_str(&match language {
+            Language::English => format!("  (+{more} more)"),
+            Language::ChineseSimplified => format!("  (还有 {more} 个)"),
+        });
+    }
+    match language {
+        Language::English => {
+            format!("{} matches, Tab/Shift-Tab cycles: {list}", candidates.len())
+        }
+        Language::ChineseSimplified => {
+            format!("{} 个匹配项，Tab/Shift-Tab 切换：{list}", candidates.len())
+        }
     }
 }

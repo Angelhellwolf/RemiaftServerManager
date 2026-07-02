@@ -55,15 +55,20 @@ On first launch, `remiaft` asks for the interface language and saves it in the
 user config. English and Simplified Chinese are supported now; press `l` in the
 TUI to change language later.
 
-Inside the TUI:
+Inside the TUI, press `?` (or F1) for the full shortcut list. The main screen
+is a server tree on the left and the selected server's live log plus a compact
+detail strip on the right. Start/stop/restart run in the background, so the UI
+never freezes while a server shuts down; the tree shows a transient
+`stopping...` state instead.
 
 ```text
+? or F1 show all shortcuts
 u edit the startup command, for example: java -Xms1G -Xmx4G -jar server.jar nogui
 o attach a native console for the selected running server
 type directly in the native console; Tab, arrows, and editing keys go to the server
 Ctrl-C in the native console sends an interrupt to the selected server
 Ctrl-U detaches from the native console without stopping the server
-b show/hide the right side panel
+b show/hide the detail strip
 use your terminal scrollback for attached console history
 n add server
 s start selected server
@@ -71,10 +76,6 @@ x stop selected server
 r restart selected server
 c send console command
 a toggle auto-restart
-e edit Java args
-g edit Minecraft server args
-p edit server directory
-j edit jar path
 d delete selected server/group
 q quit
 ```

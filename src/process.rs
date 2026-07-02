@@ -17,10 +17,12 @@ use crossterm::execute;
 use crossterm::terminal::{self, disable_raw_mode, enable_raw_mode, ClearType};
 
 use crate::config::{ConfigStore, ServerConfig};
+use crate::shutdown;
 
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const ATTACH_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -72,7 +74,15 @@ pub fn start_supervisor(store: &ConfigStore, server: &ServerConfig) -> Result<()
         .stderr(Stdio::from(stderr));
 
     detach_from_terminal(&mut command);
-    command.spawn().context("spawn remiaft supervisor")?;
+    let child = command.spawn().context("spawn remiaft supervisor")?;
+    // The supervisor detaches into its own session, but it is still a
+    // direct OS child of this process; nobody else will ever reap it, so
+    // wait on it from a throwaway thread instead of leaking a zombie once it
+    // exits.
+    thread::spawn(move || {
+        let mut child = child;
+        let _ = child.wait();
+    });
 
     Ok(())
 }
@@ -169,12 +179,38 @@ pub fn attach_terminal(store: &ConfigStore, server: &ServerConfig) -> Result<()>
 
     let mut stdin = io::stdin().lock();
     let mut buf = [0_u8; 1024];
+    let (mut cols, mut rows) = (cols, rows);
     loop {
+        if shutdown::requested() {
+            break;
+        }
+
+        if !wait_stdin_ready(ATTACH_POLL_INTERVAL)? {
+            if runtime_status(store, server) != RuntimeStatus::Running {
+                write!(
+                    stdout,
+                    "\r\n-- {} exited --\r\n-- press any key to return --\r\n",
+                    server.name
+                )?;
+                stdout.flush()?;
+                wait_for_any_key(&mut stdin)?;
+                done.store(true, Ordering::Relaxed);
+                let _ = output_thread.join();
+                return Ok(());
+            }
+            let (new_cols, new_rows) = terminal::size().unwrap_or((cols, rows));
+            if (new_cols, new_rows) != (cols, rows) {
+                (cols, rows) = (new_cols, new_rows);
+            }
+            let _ = request_terminal_resize(store, server, rows, cols);
+            continue;
+        }
+
         let read = stdin.read(&mut buf)?;
         if read == 0 {
             break;
         }
-        let (cols, rows) = terminal::size().unwrap_or((cols, rows));
+        (cols, rows) = terminal::size().unwrap_or((cols, rows));
         let _ = request_terminal_resize(store, server, rows, cols);
 
         let mut chunk_start = 0;
@@ -202,6 +238,44 @@ pub fn attach_terminal(store: &ConfigStore, server: &ServerConfig) -> Result<()>
     done.store(true, Ordering::Relaxed);
     let _ = output_thread.join();
     Ok(())
+}
+
+/// Blocks until stdin has data ready to read or `timeout` elapses, returning
+/// whether data is ready. On platforms without a portable non-blocking
+/// readiness check, this simply reports ready immediately and callers fall
+/// back to a plain blocking read (matching the previous behavior there).
+#[cfg(unix)]
+fn wait_stdin_ready(timeout: Duration) -> Result<bool> {
+    let mut fds = [libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    let rc = unsafe { libc::poll(fds.as_mut_ptr(), 1, timeout_ms) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error()).context("poll stdin");
+    }
+    Ok(rc > 0)
+}
+
+#[cfg(not(unix))]
+fn wait_stdin_ready(_timeout: Duration) -> Result<bool> {
+    Ok(true)
+}
+
+fn wait_for_any_key(stdin: &mut impl Read) -> Result<()> {
+    let mut buf = [0_u8; 1];
+    loop {
+        if shutdown::requested() {
+            return Ok(());
+        }
+        if !wait_stdin_ready(ATTACH_POLL_INTERVAL)? {
+            continue;
+        }
+        let _ = stdin.read(&mut buf)?;
+        return Ok(());
+    }
 }
 
 fn append_terminal_bytes(store: &ConfigStore, server: &ServerConfig, bytes: &[u8]) -> Result<()> {
@@ -553,10 +627,6 @@ fn sanitize_terminal_bytes(input: &[u8]) -> Vec<u8> {
     output
 }
 
-pub fn is_allowed_console_char(ch: char) -> bool {
-    ch >= ' ' && ch != '\u{7f}' && ch != '\u{a7}' && !ch.is_control()
-}
-
 fn read_allowed_input_escape_bytes(input: &[u8]) -> Option<(&[u8], usize)> {
     match input {
         [0x1b, b'[', rest @ ..] => {
@@ -873,38 +943,40 @@ fn minecraft_log_path(store: &ConfigStore, server: &ServerConfig) -> PathBuf {
 
 #[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    // Signal 0 sends nothing but still validates the pid exists; this avoids
+    // spawning a `kill` subprocess on every status check (called once per
+    // configured server on every redraw).
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
 #[cfg(windows)]
 fn pid_alive(pid: u32) -> bool {
-    Command::new("cmd")
-        .args([
-            "/C",
-            &format!("tasklist /FI \"PID eq {pid}\" | findstr {pid}"),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code: u32 = 0;
+        let alive =
+            GetExitCodeProcess(handle, &mut exit_code) != 0 && exit_code == STILL_ACTIVE as u32;
+        CloseHandle(handle);
+        alive
+    }
 }
 
 #[cfg(unix)]
 fn kill_pid(pid: u32) -> Result<()> {
-    let _ = Command::new("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
+    if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } == -1 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            return Err(err).context("send SIGTERM");
+        }
+    }
     Ok(())
 }
 

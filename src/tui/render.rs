@@ -8,7 +8,64 @@ use crate::i18n::{Language, Text};
 use crate::process;
 
 use super::input::input_view;
-use super::{App, MainView, Mode, TreeItem};
+use super::{App, Mode, PendingOp, TreeItem};
+
+/// Height of the compact detail strip under the log, including its border.
+const DETAIL_HEIGHT: u16 = 6;
+
+/// Screen regions shared between rendering and layout-dependent state (the
+/// log wrap width must match the rectangle the log is drawn into).
+pub(super) struct Regions {
+    pub(super) header: Rect,
+    pub(super) list: Rect,
+    pub(super) log: Rect,
+    pub(super) detail: Rect,
+    pub(super) footer: Rect,
+}
+
+pub(super) fn compute_regions(area: Rect, show_details: bool) -> Regions {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    let body = rows[1];
+
+    let (list, right) = if body.width >= 70 {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+            .split(body);
+        (columns[0], columns[1])
+    } else {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(body.height / 3), Constraint::Min(1)])
+            .split(body);
+        (split[0], split[1])
+    };
+
+    let (log, detail) = if show_details && right.height >= DETAIL_HEIGHT + 4 {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(DETAIL_HEIGHT)])
+            .split(right);
+        (chunks[0], chunks[1])
+    } else {
+        (right, Rect::new(right.x, right.bottom(), right.width, 0))
+    };
+
+    Regions {
+        header: rows[0],
+        list,
+        log,
+        detail,
+        footer: rows[2],
+    }
+}
 
 pub(super) fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -18,188 +75,91 @@ pub(super) fn draw(frame: &mut Frame, app: &App) {
         return;
     }
 
-    let header_height = if area.height >= 8 { 3 } else { 1 };
-    let footer_height = if area.height >= 10 { 3 } else { 1 };
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(header_height),
-            Constraint::Min(1),
-            Constraint::Length(footer_height),
-        ])
-        .split(area);
-
-    let header_text = Line::from(vec![
-        Span::styled(
-            "remiaft",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!(
-            "  {}: {}",
-            app.t(Text::Config),
-            app.store.config_path().to_string_lossy()
-        )),
-    ]);
-    let header = if chunks[0].height >= 3 {
-        Paragraph::new(header_text).block(Block::default().borders(Borders::ALL))
-    } else {
-        Paragraph::new(header_text)
-    };
-    frame.render_widget(header, chunks[0]);
-
-    if app.main_view == MainView::Console {
-        draw_console_workspace(frame, app, chunks[1]);
-    } else {
-        draw_manager_workspace(frame, app, chunks[1]);
+    let regions = compute_regions(area, app.show_details);
+    draw_header(frame, app, regions.header);
+    draw_server_list(frame, app, regions.list);
+    draw_log(frame, app, regions.log);
+    if regions.detail.height > 0 {
+        draw_detail(frame, app, regions.detail);
     }
-
-    let footer = if chunks[2].height >= 3 {
-        Paragraph::new(app.status.as_str())
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(app.t(Text::Status)),
-            )
-            .wrap(Wrap { trim: true })
-    } else {
-        Paragraph::new(app.status.as_str()).wrap(Wrap { trim: true })
-    };
-    frame.render_widget(footer, chunks[2]);
+    draw_footer(frame, app, regions.footer);
 
     if !matches!(app.mode, Mode::Normal | Mode::LanguageSelect) {
         draw_input(frame, app, centered_input_rect(area));
     }
+    if app.show_help {
+        draw_help(frame, app, area);
+    }
 }
 
-fn draw_manager_workspace(frame: &mut Frame, app: &App, area: Rect) {
-    if area.width >= 120 && app.show_details {
-        let body = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(32),
-                Constraint::Percentage(48),
-                Constraint::Percentage(20),
-            ])
-            .split(area);
-        draw_server_list(frame, app, body[0]);
-        draw_detail_workspace(frame, app, body[1]);
-        draw_quick_panel(frame, app, body[2]);
-    } else if area.width >= 72 {
-        let body = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-            .split(area);
-        draw_server_list(frame, app, body[0]);
-        draw_detail_workspace(frame, app, body[1]);
-    } else {
-        let list_height = if area.height >= 16 {
-            (area.height / 3).clamp(4, 10)
+fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let mut spans = vec![
+        Span::styled(
+            " remiaft ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+    ];
+    let total = app.config.servers.len();
+    let running = app
+        .config
+        .servers
+        .iter()
+        .filter(|server| {
+            process::runtime_status(&app.store, server) == process::RuntimeStatus::Running
+        })
+        .count();
+    spans.push(Span::styled(
+        format!("{running}/{total} "),
+        Style::default().fg(if running > 0 {
+            Color::Green
         } else {
-            (area.height / 2).max(3)
-        };
-        let body = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(list_height), Constraint::Min(1)])
-            .split(area);
-        draw_server_list(frame, app, body[0]);
-        draw_detail_workspace(frame, app, body[1]);
-    }
+            Color::DarkGray
+        }),
+    ));
+    spans.push(Span::styled(
+        match app.language {
+            Language::English => "running",
+            Language::ChineseSimplified => "运行中",
+        },
+        Style::default().fg(Color::DarkGray),
+    ));
+    spans.push(Span::styled(
+        format!(
+            "   {}: {}",
+            app.t(Text::Config),
+            app.store.config_path().to_string_lossy()
+        ),
+        Style::default().fg(Color::DarkGray),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_detail_workspace(frame: &mut Frame, app: &App, area: Rect) {
-    if area.height < 10 {
-        draw_detail(frame, app, area);
+fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 {
         return;
     }
-
-    let detail_height = detail_panel_height(app, area.width)
-        .max(4)
-        .min(area.height.saturating_sub(5));
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(detail_height)])
-        .split(area);
-    draw_server_log(frame, app, chunks[0]);
-    draw_detail(frame, app, chunks[1]);
-}
-
-fn draw_console_workspace(frame: &mut Frame, app: &App, area: Rect) {
-    if area.height < 6 {
-        draw_console(frame, app, area);
-        return;
-    }
-    let header_height = if area.height >= 12 {
-        5
-    } else if area.height >= 8 {
-        3
-    } else {
-        0
-    };
-    if header_height == 0 {
-        draw_console(frame, app, area);
-        return;
-    }
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(header_height), Constraint::Min(1)])
-        .split(area);
-    draw_console_server_header(frame, app, chunks[0]);
-    draw_console(frame, app, chunks[1]);
-}
-
-fn draw_console_server_header(frame: &mut Frame, app: &App, area: Rect) {
-    let lines = if let Some(server) = app.selected() {
-        let status = process::runtime_status(&app.store, server);
-        let mut lines = vec![Line::from(vec![
-            Span::styled(
-                format!("{}: {}", app.t(Text::Name), server.name),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+    let hints = app.t(Text::FooterHints);
+    let hints_width = hints.chars().count() as u16 + 2;
+    let status_width = area.width.saturating_sub(hints_width);
+    let line = Line::from(vec![
+        Span::styled(
+            format!(
+                " {:<width$}",
+                app.status,
+                width = status_width.max(1) as usize - 1
             ),
-            Span::raw(format!(
-                "  {}: {}  {}: {}",
-                app.t(Text::Status),
-                status_label(app, status),
-                app.t(Text::Id),
-                server.id
-            )),
-        ])];
-        if area.height >= 5 {
-            lines.push(Line::from(format!(
-                "{}: {}",
-                app.t(Text::Directory),
-                server.directory.display()
-            )));
-            lines.push(Line::from(format!(
-                "{}: {}  |  Ctrl-U {}  |  Enter {}",
-                app.t(Text::Jar),
-                server.jar_path.display(),
-                match app.language {
-                    Language::English => "detach",
-                    Language::ChineseSimplified => "脱离",
-                },
-                match app.language {
-                    Language::English => "send",
-                    Language::ChineseSimplified => "发送",
-                }
-            )));
-        }
-        lines
-    } else {
-        vec![Line::from(app.t(Text::NoServerSelected))]
-    };
-
-    let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(app.t(Text::SelectedServer)),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, area);
+            Style::default().fg(Color::White),
+        ),
+        Span::styled(hints, Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn draw_language_select(frame: &mut Frame, app: &App, area: Rect) {
@@ -236,6 +196,29 @@ fn draw_language_select(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(paragraph, centered_rect(70, 45, area));
 }
 
+fn status_span(app: &App, server: &crate::config::ServerConfig) -> Span<'static> {
+    if let Some(op) = app.pending_op(&server.id) {
+        let label = match op {
+            PendingOp::Start => app.t(Text::OpStarting),
+            PendingOp::Stop => app.t(Text::OpStopping),
+            PendingOp::Restart => app.t(Text::OpRestarting),
+        };
+        return Span::styled(
+            format!("{label:<8}"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::ITALIC),
+        );
+    }
+    let status = process::runtime_status(&app.store, server);
+    let (color, dot) = match status {
+        process::RuntimeStatus::Running => (Color::Green, "●"),
+        process::RuntimeStatus::Stopped => (Color::DarkGray, "○"),
+        process::RuntimeStatus::Stale => (Color::Yellow, "◌"),
+    };
+    Span::styled(format!("{dot} "), Style::default().fg(color))
+}
+
 fn draw_server_list(frame: &mut Frame, app: &App, area: Rect) {
     let rows = app.visible_tree();
     let items = if rows.is_empty() {
@@ -261,49 +244,43 @@ fn draw_server_list(frame: &mut Frame, app: &App, area: Rect) {
                                 .unwrap_or(false)
                         })
                         .count();
-                    let selected =
+                    let marked =
                         !ids.is_empty() && ids.iter().all(|id| app.marked_servers.contains(id));
-                    let icon = if app.expanded_groups.contains(group_id) {
-                        "[-]"
+                    let arrow = if app.expanded_groups.contains(group_id) {
+                        "▾"
                     } else {
-                        "[+]"
+                        "▸"
                     };
                     ListItem::new(Line::from(vec![
                         Span::raw("  ".repeat(row.depth)),
                         Span::styled(
-                            if selected { "[x] " } else { "[ ] " },
+                            if marked { "* " } else { "  " },
                             Style::default().fg(Color::Cyan),
                         ),
-                        Span::styled(icon, Style::default().fg(Color::Yellow)),
+                        Span::styled(format!("{arrow} "), Style::default().fg(Color::Yellow)),
                         Span::styled(
-                            format!(" {name}"),
+                            name.to_string(),
                             Style::default().add_modifier(Modifier::BOLD),
                         ),
-                        Span::raw(format!(" ({running}/{})", ids.len())),
+                        Span::styled(
+                            format!("  {running}/{}", ids.len()),
+                            Style::default().fg(Color::DarkGray),
+                        ),
                     ]))
                 }
                 TreeItem::Server(index) => {
                     let Some(server) = app.config.servers.get(*index) else {
                         return ListItem::new("");
                     };
-                    let status = process::runtime_status(&app.store, server);
-                    let color = match status {
-                        process::RuntimeStatus::Running => Color::Green,
-                        process::RuntimeStatus::Stopped => Color::Gray,
-                        process::RuntimeStatus::Stale => Color::Yellow,
-                    };
-                    let selected = app.marked_servers.contains(&server.id);
+                    let marked = app.marked_servers.contains(&server.id);
                     ListItem::new(Line::from(vec![
                         Span::raw("  ".repeat(row.depth)),
                         Span::styled(
-                            if selected { "[x] " } else { "[ ] " },
+                            if marked { "* " } else { "  " },
                             Style::default().fg(Color::Cyan),
                         ),
-                        Span::styled(
-                            format!("{:<8}", status_label(app, status)),
-                            Style::default().fg(color),
-                        ),
-                        Span::raw(format!(" {}", server.name)),
+                        status_span(app, server),
+                        Span::raw(server.name.clone()),
                     ]))
                 }
             })
@@ -315,18 +292,51 @@ fn draw_server_list(frame: &mut Frame, app: &App, area: Rect) {
         state.select(Some(app.selected));
     }
 
+    let marked = app.marked_servers.len();
+    let title = if marked > 0 {
+        format!("{} [{marked}]", app.t(Text::Servers))
+    } else {
+        app.t(Text::Servers).to_string()
+    };
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(app.t(Text::Servers)),
-        )
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
         );
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_log(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let title = if let Some(server) = app.selected() {
+        let mode = if app.console_follow {
+            app.t(Text::ConsoleFollow)
+        } else {
+            app.t(Text::ConsolePaused)
+        };
+        format!("{} - {} ({mode})", app.t(Text::ServerLog), server.name)
+    } else {
+        app.t(Text::ServerLog).to_string()
+    };
+    let bordered = area.height >= 3 && area.width >= 4;
+    let height = if bordered {
+        area.height.saturating_sub(2).max(1) as usize
+    } else {
+        area.height.max(1) as usize
+    };
+    let lines = app.console_visible_lines(height);
+    let paragraph = if bordered {
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .wrap(Wrap { trim: false })
+    } else {
+        Paragraph::new(lines).wrap(Wrap { trim: false })
+    };
+    frame.render_widget(paragraph, area);
 }
 
 fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
@@ -336,53 +346,39 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
                 .borders(Borders::ALL)
                 .title(app.t(Text::Details)),
         )
-        .scroll((app.detail_scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
-fn detail_panel_height(app: &App, width: u16) -> u16 {
-    let inner_width = width.saturating_sub(2).max(1) as usize;
-    let content_height = detail_lines(app)
-        .iter()
-        .map(|line| line.width().div_ceil(inner_width).max(1) as u16)
-        .sum::<u16>();
-    content_height.saturating_add(2)
-}
-
 fn detail_lines(app: &App) -> Vec<Line<'static>> {
     if let Some(server) = app.selected() {
+        let status = process::runtime_status(&app.store, server);
+        let status_color = match status {
+            process::RuntimeStatus::Running => Color::Green,
+            process::RuntimeStatus::Stopped => Color::DarkGray,
+            process::RuntimeStatus::Stale => Color::Yellow,
+        };
         vec![
             Line::from(vec![
                 Span::styled(
-                    format!("{}: {}", app.t(Text::Name), server.name),
+                    server.name.clone(),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(format!("  {}: {}", app.t(Text::Id), server.id)),
+                Span::styled(
+                    format!("  {}", status_label(app, status)),
+                    Style::default().fg(status_color),
+                ),
+                Span::styled(
+                    format!("  {}", server.id),
+                    Style::default().fg(Color::DarkGray),
+                ),
             ]),
             Line::from(format!(
                 "{}: {}",
                 app.t(Text::Directory),
                 server.directory.display()
-            )),
-            Line::from(format!(
-                "{}: {}",
-                app.t(Text::Jar),
-                server.jar_path.display()
-            )),
-            Line::from(format!(
-                "{}: {} | {}: {}M-{}M | {}: {} | {}: {}s",
-                app.t(Text::JavaPath),
-                server.java_bin(&app.config.java_path),
-                app.t(Text::Memory),
-                server.min_memory_mb,
-                server.max_memory_mb,
-                app.t(Text::AutoRestartField),
-                server.auto_restart,
-                app.t(Text::RestartDelay),
-                server.restart_delay_secs
             )),
             Line::from(format!(
                 "{}: {}",
@@ -393,14 +389,18 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
                     .unwrap_or_else(|| server.startup_command(&app.config.java_path))
             )),
             Line::from(format!(
-                "{}: {}",
-                app.t(Text::JavaArgs),
-                server.java_args.join(" ")
-            )),
-            Line::from(format!(
-                "{}: {}",
-                app.t(Text::ServerArgs),
-                server.server_args.join(" ")
+                "{}: {}  {}: {}M-{}M  {}: {}",
+                app.t(Text::JavaPath),
+                server.java_bin(&app.config.java_path),
+                app.t(Text::Memory),
+                server.min_memory_mb,
+                server.max_memory_mb,
+                app.t(Text::AutoRestartField),
+                if server.auto_restart {
+                    app.t(Text::Enabled)
+                } else {
+                    app.t(Text::Disabled)
+                }
             )),
         ]
     } else if let Some(group_id) = app.selected_group_id() {
@@ -433,7 +433,6 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from(format!("ID: {group_id}")),
             Line::from(match app.language {
                 Language::English => format!("Servers: {} total, {running} running", ids.len()),
                 Language::ChineseSimplified => {
@@ -441,12 +440,10 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
                 }
             }),
             Line::from(match app.language {
-                Language::English => "Enter selects all servers in this group recursively.",
-                Language::ChineseSimplified => "Enter 会递归选择该分组下的全部服务器。",
-            }),
-            Line::from(match app.language {
-                Language::English => "F5/F6/F7 start, stop, or restart the group.",
-                Language::ChineseSimplified => "F5/F6/F7 可启动、停止或重启该分组。",
+                Language::English => "Enter marks the whole group; F5/F6/F7 start/stop/restart it.",
+                Language::ChineseSimplified => {
+                    "Enter 选中整个分组；F5/F6/F7 启动/停止/重启该分组。"
+                }
             }),
         ]
     } else {
@@ -457,169 +454,83 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
     }
 }
 
-fn draw_server_log(frame: &mut Frame, app: &App, area: Rect) {
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-    let bordered = area.height >= 3 && area.width >= 4;
-    let height = if bordered {
-        area.height.saturating_sub(2).max(1) as usize
-    } else {
-        area.height.max(1) as usize
+fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
+    let entries: &[(&str, &str)] = match app.language {
+        Language::English => &[
+            ("s / x / r", "start / stop / restart current"),
+            ("F5 / F6 / F7", "start / stop / restart marked or group"),
+            ("Enter", "mark server or whole group"),
+            (
+                "o",
+                "attach native console (Ctrl-U detach, Ctrl-C interrupt)",
+            ),
+            ("c / i", "send a single console command"),
+            ("n", "new server"),
+            ("F2", "new group"),
+            ("F3 / m", "move to group"),
+            ("Left / Right", "collapse / expand group"),
+            ("d", "delete server or group"),
+            ("a", "toggle auto-restart"),
+            ("u", "edit startup command"),
+            ("p / j / y", "edit directory / jar / Java path"),
+            ("e / g", "edit Java args / server args"),
+            ("PgUp / PgDn / End", "scroll log / follow"),
+            ("b", "show/hide details"),
+            ("l", "language"),
+            ("q / Esc", "quit"),
+        ],
+        Language::ChineseSimplified => &[
+            ("s / x / r", "启动 / 停止 / 重启当前"),
+            ("F5 / F6 / F7", "启动 / 停止 / 重启已选或分组"),
+            ("Enter", "选中服务器或整个分组"),
+            ("o", "进入原生控制台（Ctrl-U 脱离，Ctrl-C 中断）"),
+            ("c / i", "发送单条控制台命令"),
+            ("n", "新建服务器"),
+            ("F2", "新建分组"),
+            ("F3 / m", "移动到分组"),
+            ("← / →", "折叠 / 展开分组"),
+            ("d", "删除服务器或分组"),
+            ("a", "切换自动重启"),
+            ("u", "编辑启动命令"),
+            ("p / j / y", "编辑目录 / jar / Java 路径"),
+            ("e / g", "编辑 Java 参数 / 服务端参数"),
+            ("PgUp / PgDn / End", "滚动日志 / 恢复跟随"),
+            ("b", "显示/隐藏详情"),
+            ("l", "语言"),
+            ("q / Esc", "退出"),
+        ],
     };
-    let width = if bordered {
-        area.width.saturating_sub(2).max(1) as usize
-    } else {
-        area.width.max(1) as usize
-    };
-    let lines = app.console_visible_lines(height, width);
-    let paragraph = if bordered {
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(app.t(Text::ServerLog)),
-            )
-            .wrap(Wrap { trim: false })
-    } else {
-        Paragraph::new(lines).wrap(Wrap { trim: false })
-    };
-    frame.render_widget(paragraph, area);
-}
 
-fn draw_console(frame: &mut Frame, app: &App, area: Rect) {
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-    draw_console_log(frame, app, area);
-}
-
-fn draw_console_log(frame: &mut Frame, app: &App, area: Rect) {
-    let title = if let Some(server) = app.selected() {
-        let mode = if app.console_follow {
-            app.t(Text::ConsoleFollow)
-        } else {
-            app.t(Text::ConsolePaused)
-        };
-        format!("{} - {} ({mode})", app.t(Text::Console), server.name)
-    } else {
-        app.t(Text::Console).to_string()
-    };
-    let bordered = area.height >= 3 && area.width >= 4;
-    let height = if bordered {
-        area.height.saturating_sub(2).max(1) as usize
-    } else {
-        area.height.max(1) as usize
-    };
-    let width = if bordered {
-        area.width.saturating_sub(2).max(1) as usize
-    } else {
-        area.width.max(1) as usize
-    };
-    let lines = app.console_visible_lines(height, width);
-    let paragraph = if bordered {
-        Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .wrap(Wrap { trim: false })
-    } else {
-        Paragraph::new(lines).wrap(Wrap { trim: false })
-    };
-    frame.render_widget(paragraph, area);
-    if let Some((row, col)) = app.console_cursor_position() {
-        let x_offset = if bordered { 1 } else { 0 };
-        let y_offset = if bordered { 1 } else { 0 };
-        let cursor_x = area.x.saturating_add(x_offset).saturating_add(col);
-        let cursor_y = area.y.saturating_add(y_offset).saturating_add(row);
-        frame.set_cursor_position(Position::new(
-            cursor_x.min(area.right().saturating_sub(1)),
-            cursor_y.min(area.bottom().saturating_sub(1)),
-        ));
-    }
-}
-
-fn draw_quick_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let mut lines = Vec::new();
+    let mut lines: Vec<Line> = entries
+        .iter()
+        .map(|(key, description)| {
+            Line::from(vec![
+                Span::styled(
+                    format!("  {key:<18}"),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(description.to_string()),
+            ])
+        })
+        .collect();
+    lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        app.t(Text::Shortcuts),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
+        format!("  {}", app.t(Text::HelpHint)),
+        Style::default().fg(Color::DarkGray),
     )));
-    lines.extend(shortcut_lines(app));
-    lines.push(Line::from(""));
-    lines.push(Line::from(app.t(Text::ConsoleHint)));
-    lines.push(Line::from(""));
-    lines.push(Line::from(app.t(Text::ManagerExitHint)));
 
-    let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(app.t(Text::QuickPanel)),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, area);
-}
-
-fn shortcut_lines(app: &App) -> Vec<Line<'static>> {
-    match app.language {
-        Language::English => vec![
-            Line::from("n  new server"),
-            Line::from("F2  new group"),
-            Line::from("Enter  select item"),
-            Line::from("Left/Right  fold group"),
-            Line::from("F3/m  move to group"),
-            Line::from("F5  start selected/group"),
-            Line::from("F6  stop selected/group"),
-            Line::from("F7  restart selected/group"),
-            Line::from("o  attach console"),
-            Line::from("i  send command"),
-            Line::from("b  side panel"),
-            Line::from("Ctrl-U  detach console"),
-            Line::from("s  start current"),
-            Line::from("x  stop current"),
-            Line::from("r  restart current"),
-            Line::from("c  console command"),
-            Line::from("a  auto-restart"),
-            Line::from("e  Java args"),
-            Line::from("y  Java path"),
-            Line::from("u  startup command"),
-            Line::from("g  server args"),
-            Line::from("p  directory"),
-            Line::from("j  jar path"),
-            Line::from("l  language"),
-            Line::from("d  delete item"),
-            Line::from("q  quit UI"),
-        ],
-        Language::ChineseSimplified => vec![
-            Line::from("n  新建服务器"),
-            Line::from("F2  新建分组"),
-            Line::from("Enter  选择项目"),
-            Line::from("←/→  折叠/展开分组"),
-            Line::from("F3/m  移动到分组"),
-            Line::from("F5  启动所选/分组"),
-            Line::from("F6  停止所选/分组"),
-            Line::from("F7  重启所选/分组"),
-            Line::from("o  原生控制台"),
-            Line::from("i  发送命令"),
-            Line::from("b  侧栏面板"),
-            Line::from("Ctrl-U  脱离控制台"),
-            Line::from("s  启动当前"),
-            Line::from("x  停止当前"),
-            Line::from("r  重启当前"),
-            Line::from("c  控制台命令"),
-            Line::from("a  自动重启"),
-            Line::from("e  Java 参数"),
-            Line::from("y  Java 路径"),
-            Line::from("u  启动命令"),
-            Line::from("g  服务端参数"),
-            Line::from("p  服务器目录"),
-            Line::from("j  Jar 路径"),
-            Line::from("l  语言"),
-            Line::from("d  删除项目"),
-            Line::from("q  退出界面"),
-        ],
-    }
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let width = 64.min(area.width);
+    let rect = centered_fixed_rect(width, height, area);
+    frame.render_widget(Clear, rect);
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(app.t(Text::Shortcuts)),
+    );
+    frame.render_widget(paragraph, rect);
 }
 
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {

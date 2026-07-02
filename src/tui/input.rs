@@ -105,14 +105,33 @@ pub(super) fn move_cursor_right(value: &str, cursor: &mut usize) {
     }
 }
 
-pub(super) fn complete_input_token(
-    input: &mut String,
-    cursor: &mut usize,
-    directory: &Path,
-) -> bool {
-    let cursor_pos = (*cursor).min(input.len());
+/// Result of a fresh (non-cycling) Tab press. `screen` itself never does
+/// completion - it just forwards keystrokes to whatever program is running
+/// inside it and lets that program's own line editor handle it. remiaft's
+/// prompt dialogs (send command, edit startup command, ...) *are* that line
+/// editor, so unlike the native console attach they need their own
+/// completion; this just makes ambiguous matches visible/cyclable instead of
+/// a silent no-op.
+pub(super) enum Completion {
+    /// No candidates at all.
+    None,
+    /// A unique match, or the common prefix across matches extended the
+    /// typed text; applied directly, nothing further to cycle through.
+    Applied,
+    /// More than one match and the common prefix couldn't extend any
+    /// further. The first candidate was inserted and `start` marks where the
+    /// completed token begins, so repeated Tab presses can cycle through
+    /// `candidates` in place.
+    Ambiguous {
+        start: usize,
+        candidates: Vec<String>,
+    },
+}
+
+pub(super) fn token_bounds(input: &str, cursor: usize) -> Option<(usize, usize)> {
+    let cursor_pos = cursor.min(input.len());
     if !input.is_char_boundary(cursor_pos) {
-        return false;
+        return None;
     }
     let start = input[..cursor_pos]
         .char_indices()
@@ -120,37 +139,63 @@ pub(super) fn complete_input_token(
         .find(|(_, ch)| ch.is_whitespace())
         .map(|(index, ch)| index + ch.len_utf8())
         .unwrap_or(0);
-    let prefix = &input[start..cursor_pos];
-    if prefix.is_empty() {
-        return false;
+    if input[start..cursor_pos].is_empty() {
+        None
+    } else {
+        Some((start, cursor_pos))
     }
-
-    let is_first_token = input[..start].trim().is_empty();
-    let Some(completion) = complete_token(prefix, directory, is_first_token) else {
-        return false;
-    };
-
-    input.replace_range(start..cursor_pos, &completion);
-    *cursor = start + completion.len();
-    true
 }
 
-fn complete_token(prefix: &str, directory: &Path, is_first_token: bool) -> Option<String> {
-    let mut candidates = path_completion_candidates(prefix, directory);
+pub(super) fn complete_input_token(
+    input: &mut String,
+    cursor: &mut usize,
+    directory: &Path,
+) -> Completion {
+    let Some((start, cursor_pos)) = token_bounds(input, *cursor) else {
+        return Completion::None;
+    };
+    let prefix = input[start..cursor_pos].to_string();
+    let is_first_token = input[..start].trim().is_empty();
+
+    let mut candidates = path_completion_candidates(&prefix, directory);
     if is_first_token && !prefix.contains('/') {
-        candidates.extend(path_command_candidates(prefix));
+        candidates.extend(path_command_candidates(&prefix));
     }
     candidates.sort();
     candidates.dedup();
 
     match candidates.as_slice() {
-        [] => None,
-        [candidate] => Some(candidate.clone()),
+        [] => Completion::None,
+        [candidate] => {
+            apply_candidate(input, cursor, start, cursor_pos, candidate);
+            Completion::Applied
+        }
         _ => {
             let common = longest_common_prefix(&candidates);
-            (common.len() > prefix.len()).then_some(common)
+            if common.len() > prefix.len() {
+                apply_candidate(input, cursor, start, cursor_pos, &common);
+                Completion::Applied
+            } else {
+                apply_candidate(input, cursor, start, cursor_pos, &candidates[0]);
+                Completion::Ambiguous { start, candidates }
+            }
         }
     }
+}
+
+/// Replaces the token at `[start, end)` with `candidate` and moves the
+/// cursor to the end of the inserted text; `end` may be an earlier
+/// completion's length rather than `start`'s original span, which is how
+/// Tab-cycling swaps one candidate for the next in place.
+pub(super) fn apply_candidate(
+    input: &mut String,
+    cursor: &mut usize,
+    start: usize,
+    end: usize,
+    candidate: &str,
+) {
+    input.replace_range(start..end, candidate);
+    *cursor = start + candidate.len();
 }
 
 fn path_completion_candidates(prefix: &str, directory: &Path) -> Vec<String> {
@@ -232,10 +277,49 @@ mod tests {
         let mut input = "sh sta".to_string();
         let mut cursor = input.len();
 
-        assert!(complete_input_token(&mut input, &mut cursor, &dir));
+        assert!(matches!(
+            complete_input_token(&mut input, &mut cursor, &dir),
+            Completion::Applied
+        ));
         assert_eq!(input, "sh start.sh ");
         assert_eq!(cursor, input.len());
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ambiguous_completion_lists_candidates_and_fills_first_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "remiaft-completion-ambiguous-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("start.sh"), "").unwrap();
+        fs::write(dir.join("start.bak"), "").unwrap();
+
+        let mut input = "start.".to_string();
+        let mut cursor = input.len();
+
+        match complete_input_token(&mut input, &mut cursor, &dir) {
+            Completion::Ambiguous { start, candidates } => {
+                assert_eq!(start, 0);
+                assert_eq!(candidates, vec!["start.bak ", "start.sh "]);
+                assert_eq!(input, candidates[0]);
+                assert_eq!(cursor, input.len());
+            }
+            _ => panic!("expected an ambiguous completion"),
+        }
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cycling_swaps_the_previously_applied_candidate() {
+        let mut input = "start.bak ".to_string();
+        let mut cursor = input.len();
+        apply_candidate(&mut input, &mut cursor, 0, "start.bak ".len(), "start.sh ");
+        assert_eq!(input, "start.sh ");
+        assert_eq!(cursor, input.len());
     }
 }

@@ -2,6 +2,7 @@ mod config;
 mod i18n;
 mod manifest;
 mod process;
+mod shutdown;
 mod tui;
 
 use anyhow::Result;
@@ -47,6 +48,7 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    shutdown::install();
     let cli = Cli::parse();
     let store = ConfigStore::new()?;
 

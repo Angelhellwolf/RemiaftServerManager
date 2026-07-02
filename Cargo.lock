@@ -1031,7 +1031,7 @@ dependencies = [
 
 [[package]]
 name = "remiaft"
-version = "0.1.26"
+version = "0.1.27"
 dependencies = [
  "anyhow",
  "clap",
@@ -1047,6 +1047,7 @@ dependencies = [
  "toml",
  "unicode-width 0.2.0",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
