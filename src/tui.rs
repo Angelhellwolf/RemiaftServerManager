@@ -24,7 +24,7 @@ mod terminal;
 
 use console_log::{ansi_to_line, wrap_console_lines};
 use input::{
-    apply_candidate, backspace_at_cursor, complete_input_token, delete_at_cursor, fallback,
+    backspace_at_cursor, complete_word, completion_display_candidates, delete_at_cursor, fallback,
     insert_at_cursor, move_cursor_left, move_cursor_right, Completion,
 };
 use startup::{apply_startup_command, normalize_startup_parts, parse_startup_command, split_args};
@@ -122,14 +122,17 @@ struct Draft {
     startup_command: String,
 }
 
-/// Tab-cycle state for an ambiguous prompt completion: `start` is the byte
-/// offset in `App::input` where the completed token begins, and `index`
-/// tracks which `candidates` entry is currently filled in so the next Tab
-/// (or Shift-Tab) press can swap it for the next (or previous) one in place.
-struct PromptCompletion {
-    start: usize,
-    candidates: Vec<String>,
-    index: usize,
+/// Bash's double-Tab state, the equivalent of readline's
+/// `rl_last_func == rl_complete && !completion_changed_buffer` check: a Tab
+/// press that left the buffer unchanged arms listing, and the next
+/// consecutive Tab displays the candidates instead of completing again.
+/// Any other key disarms it.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum TabState {
+    #[default]
+    Fresh,
+    /// The previous key was Tab and it did not modify the input.
+    ArmedForList,
 }
 
 #[derive(Debug, Clone)]
@@ -168,7 +171,7 @@ struct App {
     console_wrap_width: usize,
     console_attach_request: Option<ServerConfig>,
     needs_screen_clear: bool,
-    completion: Option<PromptCompletion>,
+    tab_state: TabState,
     ops: Arc<OpsShared>,
 }
 
@@ -211,7 +214,7 @@ impl App {
             console_wrap_width: 120,
             console_attach_request: None,
             needs_screen_clear: false,
-            completion: None,
+            tab_state: TabState::default(),
             ops: Arc::new(OpsShared::default()),
         })
     }
@@ -305,7 +308,7 @@ impl App {
 
     fn handle_input_key(&mut self, key: KeyEvent) -> Result<bool> {
         if !matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-            self.completion = None;
+            self.tab_state = TabState::Fresh;
         }
         match key.code {
             KeyCode::Esc => {
@@ -318,8 +321,7 @@ impl App {
             KeyCode::Right => move_cursor_right(&self.input, &mut self.input_cursor),
             KeyCode::Up | KeyCode::Home => self.input_cursor = 0,
             KeyCode::Down | KeyCode::End => self.input_cursor = self.input.len(),
-            KeyCode::Tab => self.complete_prompt_input(false),
-            KeyCode::BackTab => self.complete_prompt_input(true),
+            KeyCode::Tab | KeyCode::BackTab => self.complete_prompt_input(),
             KeyCode::Delete => delete_at_cursor(&mut self.input, self.input_cursor),
             KeyCode::Backspace | KeyCode::Char('h')
                 if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1102,74 +1104,80 @@ impl App {
     fn set_input(&mut self, value: String) {
         self.input = value;
         self.input_cursor = self.input.len();
-        self.completion = None;
+        self.tab_state = TabState::Fresh;
     }
 
     fn clear_input(&mut self) {
         self.input.clear();
         self.input_cursor = 0;
-        self.completion = None;
+        self.tab_state = TabState::Fresh;
     }
 
-    fn complete_prompt_input(&mut self, reverse: bool) {
-        if self.cycle_prompt_completion(reverse) {
-            return;
-        }
-        self.completion = None;
+    /// The prompt modes where the first word is a command name (completed
+    /// from PATH like bash's command position) rather than a plain filename.
+    fn completion_command_position(&self) -> bool {
+        matches!(
+            self.mode,
+            Mode::Command | Mode::EditStartupCommand | Mode::AddStartupCommand
+        )
+    }
 
-        let directory = match self.mode {
-            Mode::Command | Mode::EditStartupCommand => {
+    /// The directory the current prompt's relative filenames resolve
+    /// against, i.e. bash's working directory for this "shell".
+    fn completion_directory(&self) -> Option<PathBuf> {
+        match self.mode {
+            Mode::Command | Mode::EditStartupCommand | Mode::EditJar | Mode::EditServerArgs => {
                 self.selected().map(|server| server.directory.clone())
             }
             Mode::AddStartupCommand => Some(PathBuf::from(self.draft.dir.trim())),
-            _ => None,
-        };
-        let Some(directory) = directory else {
-            return;
-        };
-
-        match complete_input_token(&mut self.input, &mut self.input_cursor, &directory) {
-            Completion::None | Completion::Applied => {}
-            Completion::Ambiguous { start, candidates } => {
-                self.status = candidate_status_message(self.language, &candidates);
-                self.completion = Some(PromptCompletion {
-                    start,
-                    candidates,
-                    index: 0,
-                });
+            Mode::AddDir | Mode::EditDir | Mode::EditJavaPath | Mode::EditJavaArgs => {
+                Some(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
             }
+            _ => None,
         }
     }
 
-    /// If a Tab-cycle is already active for the token that was last
-    /// completed, swap in the next (or, cycling backwards for Shift-Tab,
-    /// previous) candidate in place and report `true`. Returns `false` when
-    /// there's no active cycle, or the input changed underneath it, so the
-    /// caller falls back to starting a fresh completion.
-    fn cycle_prompt_completion(&mut self, reverse: bool) -> bool {
-        let Some(completion) = &self.completion else {
-            return false;
+    /// readline's rl_complete: a Tab that modified the buffer completes; a
+    /// second consecutive Tab that changed nothing lists the candidates.
+    fn complete_prompt_input(&mut self) {
+        let Some(directory) = self.completion_directory() else {
+            return;
         };
-        let current = completion.candidates[completion.index].clone();
-        let start = completion.start;
-        let end = start + current.len();
-        if end > self.input.len() || self.input[start..end] != current {
-            return false;
+        let command_position = self.completion_command_position();
+
+        if self.tab_state == TabState::ArmedForList {
+            let candidates = completion_display_candidates(
+                &self.input,
+                self.input_cursor,
+                &directory,
+                command_position,
+            );
+            if candidates.len() > 1 {
+                self.status = candidate_status_message(self.language, &candidates);
+            }
+            return;
         }
 
-        let completion = self.completion.as_mut().expect("checked above");
-        let len = completion.candidates.len();
-        completion.index = if reverse {
-            (completion.index + len - 1) % len
+        let before = (self.input.clone(), self.input_cursor);
+        let completion = complete_word(
+            &mut self.input,
+            &mut self.input_cursor,
+            &directory,
+            command_position,
+        );
+        let changed = (self.input.as_str(), self.input_cursor) != (before.0.as_str(), before.1);
+        // matching readline, both an unchanged partial completion and a
+        // failed one arm the list; the next Tab shows what's ambiguous (or,
+        // with no matches, silently finds nothing again)
+        self.tab_state = if changed {
+            TabState::Fresh
         } else {
-            (completion.index + 1) % len
+            TabState::ArmedForList
         };
-        let next = completion.candidates[completion.index].clone();
-        let candidates = completion.candidates.clone();
-
-        apply_candidate(&mut self.input, &mut self.input_cursor, start, end, &next);
-        self.status = candidate_status_message(self.language, &candidates);
-        true
+        if matches!(completion, Completion::Partial) && !changed {
+            // bash rings the bell here; the status line is our bell
+            self.status = self.t(Text::CompletionAmbiguousHint).to_string();
+        }
     }
 
     fn update_console_layout(&mut self, area: Rect) {
@@ -1242,8 +1250,10 @@ fn op_done_message(language: Language, op: PendingOp, name: &str) -> String {
     }
 }
 
+/// The second-Tab candidate listing (readline prints these below the
+/// prompt in columns; here the status line is that display surface).
 fn candidate_status_message(language: Language, candidates: &[String]) -> String {
-    const MAX_SHOWN: usize = 6;
+    const MAX_SHOWN: usize = 12;
     let mut list = candidates
         .iter()
         .take(MAX_SHOWN)
@@ -1258,11 +1268,7 @@ fn candidate_status_message(language: Language, candidates: &[String]) -> String
         });
     }
     match language {
-        Language::English => {
-            format!("{} matches, Tab/Shift-Tab cycles: {list}", candidates.len())
-        }
-        Language::ChineseSimplified => {
-            format!("{} 个匹配项，Tab/Shift-Tab 切换：{list}", candidates.len())
-        }
+        Language::English => format!("{} matches: {list}", candidates.len()),
+        Language::ChineseSimplified => format!("{} 个匹配项：{list}", candidates.len()),
     }
 }

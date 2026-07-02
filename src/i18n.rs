@@ -92,6 +92,7 @@ pub enum Text {
     OpStarting,
     OpStopping,
     OpRestarting,
+    CompletionAmbiguousHint,
 }
 
 pub fn text(language: Language, key: Text) -> &'static str {
@@ -167,6 +168,7 @@ fn english(key: Text) -> &'static str {
         Text::OpStarting => "starting...",
         Text::OpStopping => "stopping...",
         Text::OpRestarting => "restarting...",
+        Text::CompletionAmbiguousHint => "ambiguous completion, press Tab again to list matches",
     }
 }
 
@@ -234,5 +236,6 @@ fn chinese_simplified(key: Text) -> &'static str {
         Text::OpStarting => "启动中...",
         Text::OpStopping => "停止中...",
         Text::OpRestarting => "重启中...",
+        Text::CompletionAmbiguousHint => "补全不唯一，再按一次 Tab 列出所有匹配项",
     }
 }
