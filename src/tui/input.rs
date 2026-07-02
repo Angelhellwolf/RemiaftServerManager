@@ -308,9 +308,15 @@ fn resolve_lookup_dir(dir_part: &str, directory: &Path) -> PathBuf {
 /// (std's read_dir already omits `.` and `..`, and `match-hidden-files`
 /// defaults to on, so dotfiles are included).
 fn filename_candidates(prefix: &str, directory: &Path) -> Vec<Candidate> {
-    let split = prefix.char_indices().rev().find(|(_, ch)| is_separator(*ch));
+    let split = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| is_separator(*ch));
     let (dir_part, name_prefix) = match split {
-        Some((index, ch)) => (&prefix[..index + ch.len_utf8()], &prefix[index + ch.len_utf8()..]),
+        Some((index, ch)) => (
+            &prefix[..index + ch.len_utf8()],
+            &prefix[index + ch.len_utf8()..],
+        ),
         None => ("", prefix),
     };
     let Ok(entries) = fs::read_dir(resolve_lookup_dir(dir_part, directory)) else {
@@ -509,10 +515,8 @@ mod tests {
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "remiaft-completion-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("remiaft-completion-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
