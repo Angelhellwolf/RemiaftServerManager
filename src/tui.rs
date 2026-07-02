@@ -1202,13 +1202,17 @@ fn read_log_tail(path: &Path, tail_bytes: u64) -> Option<String> {
     file.seek(SeekFrom::Start(offset)).ok()?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf).ok()?;
-    let mut content = String::from_utf8_lossy(&buf).into_owned();
+    // Drop the leading partial line before decoding: a tail read that starts
+    // mid-character would otherwise make strict UTF-8 validation fail for the
+    // whole buffer and misroute clean UTF-8 logs into the legacy fallback.
+    let mut bytes = buf.as_slice();
     if offset > 0 {
-        if let Some(newline) = content.find('\n') {
-            content.drain(..=newline);
+        match bytes.iter().position(|byte| *byte == b'\n') {
+            Some(newline) => bytes = &bytes[newline + 1..],
+            None => bytes = &[],
         }
     }
-    Some(content)
+    Some(crate::encoding::decode_console_bytes(bytes))
 }
 
 fn op_progress_message(language: Language, op: PendingOp, servers: &[ServerConfig]) -> String {

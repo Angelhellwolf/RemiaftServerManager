@@ -1,4 +1,5 @@
 mod config;
+mod encoding;
 mod i18n;
 mod manifest;
 mod process;
