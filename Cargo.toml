@@ -8,9 +8,11 @@ repository = "https://github.com/Angelhellwolf/RemiaftServerManager"
 
 [dependencies]
 anyhow = "1"
+chardetng = "0.1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 dirs = "6"
+encoding_rs = "0.8"
 ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

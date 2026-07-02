@@ -17,6 +17,7 @@ use crossterm::execute;
 use crossterm::terminal::{self, disable_raw_mode, enable_raw_mode, ClearType};
 
 use crate::config::{ConfigStore, ServerConfig};
+use crate::encoding::StreamDecoder;
 use crate::shutdown;
 
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -306,6 +307,10 @@ fn append_terminal_bytes_to_queue(
 fn tail_terminal_output(path: PathBuf, mut offset: u64, done: Arc<AtomicBool>) {
     let mut stdout = io::stdout();
     let mut buf = [0_u8; 8192];
+    // Decode before writing to the user's terminal: the server may log in a
+    // legacy encoding (GBK, Shift_JIS, ...), and raw legacy bytes render as
+    // mojibake on a UTF-8 terminal and fail outright on a Windows console.
+    let mut decoder = StreamDecoder::new();
     while !done.load(Ordering::Relaxed) {
         if let Ok(mut file) = File::open(&path) {
             if let Ok(len) = file.metadata().map(|metadata| metadata.len()) {
@@ -319,7 +324,7 @@ fn tail_terminal_output(path: PathBuf, mut offset: u64, done: Arc<AtomicBool>) {
                         Ok(0) => break,
                         Ok(n) => {
                             offset = offset.saturating_add(n as u64);
-                            let _ = stdout.write_all(&buf[..n]);
+                            let _ = stdout.write_all(decoder.push(&buf[..n]).as_bytes());
                             let _ = stdout.flush();
                         }
                         Err(_) => break,
@@ -329,6 +334,8 @@ fn tail_terminal_output(path: PathBuf, mut offset: u64, done: Arc<AtomicBool>) {
         }
         thread::sleep(Duration::from_millis(50));
     }
+    let _ = stdout.write_all(decoder.flush().as_bytes());
+    let _ = stdout.flush();
 }
 
 fn replay_terminal_output(path: &Path, offset: u64) -> Result<()> {
@@ -339,14 +346,16 @@ fn replay_terminal_output(path: &Path, offset: u64) -> Result<()> {
     file.seek(SeekFrom::Start(offset))?;
     let mut stdout = io::stdout();
     let mut buf = [0_u8; 8192];
+    let mut decoder = StreamDecoder::new();
     loop {
         match file.read(&mut buf)? {
             0 => break,
             n => {
-                stdout.write_all(&buf[..n])?;
+                stdout.write_all(decoder.push(&buf[..n]).as_bytes())?;
             }
         }
     }
+    stdout.write_all(decoder.flush().as_bytes())?;
     stdout.flush()?;
     Ok(())
 }
