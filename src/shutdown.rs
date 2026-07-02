@@ -58,7 +58,10 @@ fn install_panic_hook() {
 fn install_platform_handlers() {
     unsafe {
         for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT, libc::SIGQUIT] {
-            libc::signal(signal, handle_unix_signal as libc::sighandler_t);
+            libc::signal(
+                signal,
+                handle_unix_signal as *const () as libc::sighandler_t,
+            );
         }
     }
 }
