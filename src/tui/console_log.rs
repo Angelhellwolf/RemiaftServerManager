@@ -2,6 +2,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 
+const TAB_STOP: usize = 8;
+
 pub(super) fn wrap_console_lines(lines: &[String], width: usize) -> Vec<String> {
     let mut wrapped = Vec::new();
     for line in lines {
@@ -34,7 +36,12 @@ fn wrap_console_line(line: &str, width: usize, output: &mut Vec<String>) {
             continue;
         }
 
-        if ch.is_control() && ch != '\t' {
+        if ch == '\t' {
+            push_tab(&mut current, &mut current_width, width, output);
+            continue;
+        }
+
+        if ch.is_control() {
             continue;
         }
 
@@ -78,7 +85,13 @@ pub(super) fn ansi_to_line(input: &str) -> Line<'static> {
             continue;
         }
 
-        if ch.is_control() && ch != '\t' {
+        if ch == '\t' {
+            let width = display_width(&spans, &text);
+            push_tab_text(&mut text, width);
+            continue;
+        }
+
+        if ch.is_control() {
             continue;
         }
 
@@ -188,6 +201,43 @@ fn push_ansi_span(spans: &mut Vec<Span<'static>>, text: &mut String, style: Styl
     }
 }
 
+fn push_tab(
+    current: &mut String,
+    current_width: &mut usize,
+    wrap_width: usize,
+    wrapped: &mut Vec<String>,
+) {
+    let spaces = tab_spaces(*current_width);
+    if *current_width > 0 && *current_width + spaces > wrap_width {
+        wrapped.push(std::mem::take(current));
+        *current_width = 0;
+    }
+    let spaces = tab_spaces(*current_width);
+    current.extend(std::iter::repeat_n(' ', spaces));
+    *current_width += spaces;
+}
+
+fn push_tab_text(text: &mut String, width: usize) {
+    text.extend(std::iter::repeat_n(' ', tab_spaces(width)));
+}
+
+fn tab_spaces(width: usize) -> usize {
+    let remainder = width % TAB_STOP;
+    if remainder == 0 {
+        TAB_STOP
+    } else {
+        TAB_STOP - remainder
+    }
+}
+
+fn display_width(spans: &[Span<'static>], text: &str) -> usize {
+    spans
+        .iter()
+        .map(|span| UnicodeWidthStrExt::width(span.content.as_ref()))
+        .sum::<usize>()
+        + UnicodeWidthStrExt::width(text)
+}
+
 fn apply_sgr(style: &mut Style, sequence: &str) {
     let values = if sequence.trim().is_empty() {
         vec![0]
@@ -268,10 +318,23 @@ struct UnicodeWidthStrExt;
 
 impl UnicodeWidthStrExt {
     fn width(value: &str) -> usize {
-        value
-            .chars()
-            .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
-            .sum()
+        let mut width = 0;
+        let mut chars = value.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\u{1b}' {
+                let _ = read_ansi_sequence(&mut chars);
+                continue;
+            }
+            if ch == '\t' {
+                width += tab_spaces(width);
+                continue;
+            }
+            if ch.is_control() {
+                continue;
+            }
+            width += UnicodeWidthChar::width(ch).unwrap_or(0);
+        }
+        width
     }
 }
 
@@ -307,5 +370,54 @@ mod tests {
 
         assert!(wrapped.len() > 1);
         assert!(joined.contains("but this text must continue."));
+    }
+
+    #[test]
+    fn normalizes_terminal_redraw_sequences_and_tabs_before_rendering() {
+        let lines = vec![
+            "\u{1b}[m> \r\u{1b}[K\u{1b}[33;1m[00:00:00 LEVEL]: \tat package.Class.method(Source.java:1)"
+                .to_string(),
+        ];
+
+        let wrapped = wrap_console_lines(&lines, 120);
+        let rendered = ansi_to_line(&wrapped[0]);
+        let text = rendered
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(!wrapped[0].contains('\t'));
+        assert!(!text.contains('\t'));
+        assert!(!text.contains("> "));
+        assert_eq!(
+            text,
+            "[00:00:00 LEVEL]:       at package.Class.method(Source.java:1)"
+        );
+        assert_eq!(rendered.spans[0].style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn expands_tabs_by_display_column_when_wrapping() {
+        let lines = vec!["1234567\tabc".to_string()];
+
+        let wrapped = wrap_console_lines(&lines, 8);
+
+        assert_eq!(wrapped, vec!["1234567 ".to_string(), "abc".to_string()]);
+    }
+
+    #[test]
+    fn width_calculation_ignores_ansi_sequences_when_backspacing() {
+        let lines = vec!["\u{1b}[33mabc\u{8}d".to_string()];
+
+        let wrapped = wrap_console_lines(&lines, 3);
+        let text = ansi_to_line(&wrapped[0])
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(text, "abd");
     }
 }
