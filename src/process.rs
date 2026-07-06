@@ -61,6 +61,15 @@ pub fn start_supervisor(store: &ConfigStore, server: &ServerConfig) -> Result<()
     }
 
     fs::create_dir_all(server_runtime_dir(store, server))?;
+    // Publish the current terminal size before the supervisor spawns so its
+    // PTY is born at the width it will actually be viewed at. The server's
+    // console (JLine) records width-dependent cursor sequences into the log;
+    // if the PTY starts at some default width and is only resized once a
+    // client attaches, the entire startup burst is formatted for the wrong
+    // width and replays as scrambled, double-column output.
+    if let Ok((cols, rows)) = terminal::size() {
+        let _ = request_terminal_resize(store, server, rows, cols);
+    }
     let exe = std::env::current_exe().context("resolve current executable")?;
     let log = supervisor_log_path(store, server);
     let stdout = append_file(&log)?;
@@ -425,7 +434,12 @@ fn run_server_once(
 
     fs::write(command_path(store, server), b"")?;
 
-    let (master, slave_fd) = open_pty()?;
+    // Seed the PTY at the viewing terminal's size (published by
+    // start_supervisor, or left over from the last attach) so JLine formats
+    // its output for the right width from the very first line. Falls back to a
+    // sane default for headless starts with no terminal on record.
+    let (initial_rows, initial_cols) = initial_pty_size(store, server);
+    let (master, slave_fd) = open_pty(initial_rows, initial_cols)?;
     configure_pty_slave(slave_fd)?;
     set_nonblocking(&master)?;
     let slave = unsafe { File::from_raw_fd(slave_fd) };
@@ -776,15 +790,37 @@ fn pump_terminal_resize(
     Ok(())
 }
 
+/// The PTY size used when no viewing terminal size has been recorded yet
+/// (headless `remiaft start` with stdout redirected, for example).
 #[cfg(unix)]
-fn open_pty() -> Result<(File, i32)> {
+const DEFAULT_PTY_SIZE: (u16, u16) = (40, 160);
+
+/// Reads the viewing terminal size published to the resize file, falling back
+/// to [`DEFAULT_PTY_SIZE`] when it is absent or unparsable. Returns
+/// `(rows, cols)` to match the resize file's field order.
+#[cfg(unix)]
+fn initial_pty_size(store: &ConfigStore, server: &ServerConfig) -> (u16, u16) {
+    let Ok(raw) = fs::read_to_string(resize_path(store, server)) else {
+        return DEFAULT_PTY_SIZE;
+    };
+    let mut parts = raw.split_whitespace();
+    let rows = parts.next().and_then(|value| value.parse::<u16>().ok());
+    let cols = parts.next().and_then(|value| value.parse::<u16>().ok());
+    match (rows, cols) {
+        (Some(rows), Some(cols)) => (rows.max(1), cols.max(1)),
+        _ => DEFAULT_PTY_SIZE,
+    }
+}
+
+#[cfg(unix)]
+fn open_pty(rows: u16, cols: u16) -> Result<(File, i32)> {
     let mut master_fd = 0;
     let mut slave_fd = 0;
     #[cfg(target_vendor = "apple")]
     let rc = {
         let mut size = libc::winsize {
-            ws_row: 40,
-            ws_col: 160,
+            ws_row: rows,
+            ws_col: cols,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
@@ -801,8 +837,8 @@ fn open_pty() -> Result<(File, i32)> {
     #[cfg(not(target_vendor = "apple"))]
     let rc = {
         let size = libc::winsize {
-            ws_row: 40,
-            ws_col: 160,
+            ws_row: rows,
+            ws_col: cols,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
