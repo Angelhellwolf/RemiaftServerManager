@@ -3,6 +3,7 @@ use std::io::{self, Stdout, Write};
 use anyhow::Result;
 use crossterm::cursor;
 use crossterm::execute;
+use crossterm::style;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, Clear as TerminalClear, ClearType, EnterAlternateScreen,
     LeaveAlternateScreen,
@@ -19,9 +20,17 @@ impl TerminalGuard {
     pub(super) fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            style::ResetColor,
+            TerminalClear(ClearType::All),
+            cursor::MoveTo(0, 0),
+            cursor::Hide
+        )?;
         let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend)?;
+        let mut terminal = Terminal::new(backend)?;
+        terminal.clear()?;
         Ok(Self { terminal })
     }
 
@@ -62,10 +71,12 @@ impl TerminalGuard {
         execute!(
             self.terminal.backend_mut(),
             EnterAlternateScreen,
+            style::ResetColor,
             TerminalClear(ClearType::All),
             cursor::MoveTo(0, 0)
         )?;
         self.terminal.hide_cursor()?;
+        self.terminal.clear()?;
         Ok(())
     }
 }

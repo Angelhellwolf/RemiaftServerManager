@@ -96,6 +96,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 {
         return;
     }
+    frame.render_widget(Clear, area);
     let mut spans = vec![
         Span::styled(
             " remiaft ",
@@ -145,6 +146,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 {
         return;
     }
+    frame.render_widget(Clear, area);
     let hints = app.t(Text::FooterHints);
     let hints_width = hints.chars().count() as u16 + 2;
     let status_width = area.width.saturating_sub(hints_width);
@@ -163,6 +165,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_language_select(frame: &mut Frame, app: &App, area: Rect) {
+    frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(app.t(Text::LanguagePromptTitle));
@@ -220,6 +223,10 @@ fn status_span(app: &App, server: &crate::config::ServerConfig) -> Span<'static>
 }
 
 fn draw_server_list(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    frame.render_widget(Clear, area);
     let rows = app.visible_tree();
     let items = if rows.is_empty() {
         vec![ListItem::new(app.t(Text::NoServers))]
@@ -312,6 +319,7 @@ fn draw_log(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
     }
+    frame.render_widget(Clear, area);
     let title = if let Some(server) = app.selected() {
         let mode = if app.console_follow {
             app.t(Text::ConsoleFollow)
@@ -340,6 +348,10 @@ fn draw_log(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    frame.render_widget(Clear, area);
     let paragraph = Paragraph::new(detail_lines(app))
         .block(
             Block::default()
