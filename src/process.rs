@@ -159,7 +159,7 @@ pub fn attach_terminal(store: &ConfigStore, server: &ServerConfig) -> Result<()>
         return Err(anyhow!("{} is not running", server.name));
     }
     fs::create_dir_all(server_runtime_dir(store, server))?;
-    let _raw = AttachTerminalGuard::enter()?;
+    let mut terminal_guard = AttachTerminalGuard::enter()?;
     let (cols, rows) = terminal::size().unwrap_or((120, 40));
     let _ = request_terminal_resize(store, server, rows, cols);
 
@@ -168,8 +168,6 @@ pub fn attach_terminal(store: &ConfigStore, server: &ServerConfig) -> Result<()>
         .map(|metadata| metadata.len())
         .unwrap_or(0);
     let replay_offset = log_len.saturating_sub(64 * 1024);
-    let done = Arc::new(AtomicBool::new(false));
-
     let mut stdout = io::stdout();
     execute!(
         stdout,
@@ -184,8 +182,7 @@ pub fn attach_terminal(store: &ConfigStore, server: &ServerConfig) -> Result<()>
     replay_terminal_output(&minecraft_log_path(store, server), replay_offset)?;
     stdout.flush()?;
 
-    let output_done = Arc::clone(&done);
-    let output_thread = thread::spawn(move || tail_terminal_output(log_path, log_len, output_done));
+    terminal_guard.start_output(log_path, log_len);
 
     let mut stdin = io::stdin().lock();
     let mut buf = [0_u8; 1024];
@@ -197,6 +194,7 @@ pub fn attach_terminal(store: &ConfigStore, server: &ServerConfig) -> Result<()>
 
         if !wait_stdin_ready(ATTACH_POLL_INTERVAL)? {
             if runtime_status(store, server) != RuntimeStatus::Running {
+                terminal_guard.stop_output();
                 write!(
                     stdout,
                     "\r\n-- {} exited --\r\n-- press any key to return --\r\n",
@@ -204,8 +202,6 @@ pub fn attach_terminal(store: &ConfigStore, server: &ServerConfig) -> Result<()>
                 )?;
                 stdout.flush()?;
                 wait_for_any_key(&mut stdin)?;
-                done.store(true, Ordering::Relaxed);
-                let _ = output_thread.join();
                 return Ok(());
             }
             let (new_cols, new_rows) = terminal::size().unwrap_or((cols, rows));
@@ -228,8 +224,7 @@ pub fn attach_terminal(store: &ConfigStore, server: &ServerConfig) -> Result<()>
             match buf[index] {
                 0x15 => {
                     append_terminal_bytes(store, server, &buf[chunk_start..index])?;
-                    done.store(true, Ordering::Relaxed);
-                    let _ = output_thread.join();
+                    terminal_guard.stop_output();
                     stdout.write_all(b"\r\n-- detached --\r\n")?;
                     stdout.flush()?;
                     return Ok(());
@@ -245,8 +240,6 @@ pub fn attach_terminal(store: &ConfigStore, server: &ServerConfig) -> Result<()>
         append_terminal_bytes(store, server, &buf[chunk_start..read])?;
     }
 
-    done.store(true, Ordering::Relaxed);
-    let _ = output_thread.join();
     Ok(())
 }
 
@@ -264,7 +257,11 @@ fn wait_stdin_ready(timeout: Duration) -> Result<bool> {
     let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
     let rc = unsafe { libc::poll(fds.as_mut_ptr(), 1, timeout_ms) };
     if rc < 0 {
-        return Err(io::Error::last_os_error()).context("poll stdin");
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(error).context("poll stdin");
     }
     Ok(rc > 0)
 }
@@ -369,19 +366,36 @@ fn replay_terminal_output(path: &Path, offset: u64) -> Result<()> {
     Ok(())
 }
 
-struct AttachTerminalGuard;
+struct AttachTerminalGuard {
+    output: Option<(Arc<AtomicBool>, thread::JoinHandle<()>)>,
+}
 
 impl AttachTerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, cursor::Show)?;
-        Ok(Self)
+        Ok(Self { output: None })
+    }
+
+    fn start_output(&mut self, path: PathBuf, offset: u64) {
+        let done = Arc::new(AtomicBool::new(false));
+        let output_done = Arc::clone(&done);
+        let output_thread = thread::spawn(move || tail_terminal_output(path, offset, output_done));
+        self.output = Some((done, output_thread));
+    }
+
+    fn stop_output(&mut self) {
+        if let Some((done, output_thread)) = self.output.take() {
+            done.store(true, Ordering::Relaxed);
+            let _ = output_thread.join();
+        }
     }
 }
 
 impl Drop for AttachTerminalGuard {
     fn drop(&mut self) {
+        self.stop_output();
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), cursor::Show);
     }
@@ -1039,6 +1053,29 @@ fn kill_pid(pid: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_guard_stops_output_on_drop() {
+        let done = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(AtomicBool::new(false));
+        let output_done = Arc::clone(&done);
+        let output_exited = Arc::clone(&exited);
+        let guard = AttachTerminalGuard {
+            output: Some((
+                done,
+                thread::spawn(move || {
+                    while !output_done.load(Ordering::Relaxed) {
+                        thread::yield_now();
+                    }
+                    output_exited.store(true, Ordering::Relaxed);
+                }),
+            )),
+        };
+
+        drop(guard);
+
+        assert!(exited.load(Ordering::Relaxed));
+    }
 
     fn sanitize_text(input: &str) -> String {
         String::from_utf8_lossy(&sanitize_terminal_bytes(input.as_bytes())).into_owned()
