@@ -47,7 +47,7 @@ enum Commands {
     Supervise { server_id: String },
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     shutdown::install();
     let cli = Cli::parse();
