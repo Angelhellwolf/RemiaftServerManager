@@ -864,6 +864,7 @@ fn configure_pty_slave(slave_fd: i32) -> Result<()> {
     if unsafe { libc::tcgetattr(slave_fd, &mut termios) } == -1 {
         return Err(std::io::Error::last_os_error()).context("read pty termios");
     }
+    termios.c_lflag &= !(libc::ECHO | libc::ECHONL);
     termios.c_cc[libc::VERASE] = 0x7f;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
