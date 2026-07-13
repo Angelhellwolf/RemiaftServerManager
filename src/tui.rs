@@ -178,7 +178,7 @@ struct App {
 impl App {
     fn new(store: ConfigStore) -> Result<Self> {
         let config = store.load()?;
-        let expanded_groups = config.groups.iter().map(|group| group.id.clone()).collect();
+        let expanded_groups = HashSet::new();
         let saved_language = config.language.as_deref().and_then(Language::from_code);
         let language = saved_language.unwrap_or(Language::English);
         let mode = if saved_language.is_some() {
