@@ -1,8 +1,9 @@
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -40,6 +41,11 @@ impl ConfigStore {
         &self.runtime_dir
     }
 
+    pub fn signature(&self) -> Option<(u64, std::time::SystemTime)> {
+        let metadata = fs::metadata(&self.config_path).ok()?;
+        Some((metadata.len(), metadata.modified().ok()?))
+    }
+
     pub fn load(&self) -> Result<RemiaftConfig> {
         fs::create_dir_all(&self.runtime_dir)
             .with_context(|| format!("create runtime dir {}", self.runtime_dir.display()))?;
@@ -49,8 +55,19 @@ impl ConfigStore {
             return Ok(config);
         }
 
-        let raw = fs::read_to_string(&self.config_path)
-            .with_context(|| format!("read {}", self.config_path.display()))?;
+        let lock_path = self.lock_path();
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("open config lock {}", lock_path.display()))?;
+        lock.lock_shared()
+            .with_context(|| format!("lock config {}", lock_path.display()))?;
+        let read_result = fs::read_to_string(&self.config_path)
+            .with_context(|| format!("read {}", self.config_path.display()));
+        let _ = FileExt::unlock(&lock);
+        let raw = read_result?;
         let mut config: RemiaftConfig = toml::from_str(&raw)
             .with_context(|| format!("parse {}", self.config_path.display()))?;
         if config.normalize_startup_commands() {
@@ -63,9 +80,24 @@ impl ConfigStore {
         if let Some(parent) = self.config_path.parent() {
             fs::create_dir_all(parent)?;
         }
+        let lock_path = self.lock_path();
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("open config lock {}", lock_path.display()))?;
+        lock.lock_exclusive()
+            .with_context(|| format!("lock config {}", lock_path.display()))?;
         let raw = toml::to_string_pretty(config)?;
-        fs::write(&self.config_path, raw)
-            .with_context(|| format!("write {}", self.config_path.display()))
+        let result = fs::write(&self.config_path, raw)
+            .with_context(|| format!("write {}", self.config_path.display()));
+        let _ = FileExt::unlock(&lock);
+        result
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        PathBuf::from(format!("{}.dynamic.lock", self.config_path.display()))
     }
 }
 

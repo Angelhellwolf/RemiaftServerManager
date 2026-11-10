@@ -81,6 +81,14 @@ impl StreamDecoder {
         }
     }
 
+    /// Best-effort display text for bytes that are intentionally still held
+    /// back waiting for a newline or the rest of a multi-byte character. The
+    /// bytes remain pending and a later [`Self::push`] can still decode the
+    /// complete sequence accurately.
+    pub fn pending_preview(&self) -> String {
+        decode_console_bytes(&self.pending)
+    }
+
     /// Decodes anything still buffered; call when the stream ends.
     pub fn flush(&mut self) -> String {
         if self.pending.is_empty() {
@@ -159,6 +167,18 @@ mod tests {
         output.push_str(&decoder.push(&bytes[..3]));
         output.push_str(&decoder.push(&bytes[3..]));
         assert_eq!(output, "服务器\n");
+    }
+
+    #[test]
+    fn stream_previews_legacy_text_without_consuming_it() {
+        let mut decoder = StreamDecoder::new();
+        // GBK "服务器" without a trailing newline.
+        let bytes = [0xb7, 0xfe, 0xce, 0xf1, 0xc6, 0xf7];
+
+        assert!(decoder.push(&bytes).is_empty());
+        assert_eq!(decoder.pending_preview(), "服务器");
+        assert_eq!(decoder.push(b"\n"), "服务器\n");
+        assert!(decoder.pending_preview().is_empty());
     }
 
     #[test]

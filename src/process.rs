@@ -21,9 +21,17 @@ use crate::encoding::StreamDecoder;
 use crate::shutdown;
 
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
+#[cfg(unix)]
+const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const SUPERVISOR_READY_TIMEOUT: Duration = Duration::from_secs(3);
+const SUPERVISOR_READY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const ATTACH_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const CONSOLE_EXIT_RETURN_TIMEOUT: Duration = Duration::from_secs(5);
+const ATTACH_LOG_REOPEN_INTERVAL: Duration = Duration::from_secs(1);
+const ATTACH_LOG_MARKER_BYTES: usize = 64;
+const ATTACH_REPLAY_BYTES: u64 = 64 * 1024;
 
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -61,6 +69,10 @@ pub fn start_supervisor(store: &ConfigStore, server: &ServerConfig) -> Result<()
     }
 
     fs::create_dir_all(server_runtime_dir(store, server))?;
+    // Clear only a stop request left by an earlier run. Once the child has
+    // been spawned, a new stop flag belongs to this launch and must never be
+    // erased by a slow supervisor startup.
+    let _ = fs::remove_file(stop_flag_path(store, server));
     // Publish the current terminal size before the supervisor spawns so its
     // PTY is born at the width it will actually be viewed at. The server's
     // console (JLine) records width-dependent cursor sequences into the log;
@@ -84,16 +96,57 @@ pub fn start_supervisor(store: &ConfigStore, server: &ServerConfig) -> Result<()
         .stderr(Stdio::from(stderr));
 
     detach_from_terminal(&mut command);
-    let child = command.spawn().context("spawn remiaft supervisor")?;
+    let mut child = command.spawn().context("spawn remiaft supervisor")?;
+    let ready_started = Instant::now();
+    let mut ready = false;
+    while ready_started.elapsed() < SUPERVISOR_READY_TIMEOUT {
+        if runtime_status(store, server) == RuntimeStatus::Running {
+            ready = true;
+            break;
+        }
+        let child_status = match child.try_wait() {
+            Ok(status) => status,
+            Err(err) => {
+                thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Err(err).context("check remiaft supervisor");
+            }
+        };
+        if let Some(status) = child_status {
+            return Err(anyhow!("remiaft supervisor exited early with {status}"));
+        }
+        thread::sleep(SUPERVISOR_READY_POLL_INTERVAL);
+    }
+    if !ready {
+        ready = runtime_status(store, server) == RuntimeStatus::Running;
+    }
+    if !ready {
+        let child_status = match child.try_wait() {
+            Ok(status) => status,
+            Err(err) => {
+                thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Err(err).context("check remiaft supervisor");
+            }
+        };
+        if let Some(status) = child_status {
+            return Err(anyhow!("remiaft supervisor exited early with {status}"));
+        }
+    }
     // The supervisor detaches into its own session, but it is still a
     // direct OS child of this process; nobody else will ever reap it, so
     // wait on it from a throwaway thread instead of leaking a zombie once it
     // exits.
     thread::spawn(move || {
-        let mut child = child;
         let _ = child.wait();
     });
 
+    // A still-live supervisor owns the launch request even if an unusually
+    // slow filesystem delayed PID publication past the handshake window.
+    // Returning an error here would encourage a retry and risk two
+    // supervisors; the periodic runtime snapshot will observe late readiness.
     Ok(())
 }
 
@@ -161,13 +214,11 @@ pub fn attach_terminal(store: &ConfigStore, server: &ServerConfig) -> Result<()>
     fs::create_dir_all(server_runtime_dir(store, server))?;
     let mut terminal_guard = AttachTerminalGuard::enter()?;
     let (cols, rows) = terminal::size().unwrap_or((120, 40));
-    let _ = request_terminal_resize(store, server, rows, cols);
+    let mut published_size = request_terminal_resize(store, server, rows, cols)
+        .is_ok()
+        .then_some((cols, rows));
 
     let log_path = minecraft_log_path(store, server);
-    let log_len = fs::metadata(&log_path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    let replay_offset = log_len.saturating_sub(64 * 1024);
     let mut stdout = io::stdout();
     execute!(
         stdout,
@@ -179,10 +230,10 @@ pub fn attach_terminal(store: &ConfigStore, server: &ServerConfig) -> Result<()>
         "\r\n-- remiaft native console: {} --\r\nCtrl-U detach | Ctrl-C interrupt server | terminal scrollback for history\r\n\r\n",
         server.name
     )?;
-    replay_terminal_output(&minecraft_log_path(store, server), replay_offset)?;
+    let (replay_end, replay_marker) = replay_terminal_output(&log_path)?;
     stdout.flush()?;
 
-    terminal_guard.start_output(log_path, log_len);
+    terminal_guard.start_output(log_path, replay_end, replay_marker);
 
     let mut stdin = io::stdin().lock();
     let mut buf = [0_u8; 1024];
@@ -192,32 +243,42 @@ pub fn attach_terminal(store: &ConfigStore, server: &ServerConfig) -> Result<()>
             break;
         }
 
-        if !wait_stdin_ready(ATTACH_POLL_INTERVAL)? {
+        let Some(read) = read_attach_input(&mut stdin, &mut buf, ATTACH_POLL_INTERVAL)? else {
             if runtime_status(store, server) != RuntimeStatus::Running {
                 terminal_guard.stop_output();
                 write!(
                     stdout,
-                    "\r\n-- {} exited --\r\n-- press any key to return --\r\n",
-                    server.name
+                    "\r\n-- {} exited --\r\n-- press any key to return (auto-return in {}s) --\r\n",
+                    server.name,
+                    CONSOLE_EXIT_RETURN_TIMEOUT.as_secs()
                 )?;
                 stdout.flush()?;
-                wait_for_any_key(&mut stdin)?;
+                // Release the long-lived stdin lock before the platform
+                // specific key poller reads from the terminal.
+                drop(stdin);
+                wait_for_any_key(CONSOLE_EXIT_RETURN_TIMEOUT)?;
                 return Ok(());
             }
             let (new_cols, new_rows) = terminal::size().unwrap_or((cols, rows));
-            if (new_cols, new_rows) != (cols, rows) {
-                (cols, rows) = (new_cols, new_rows);
+            (cols, rows) = (new_cols, new_rows);
+            if published_size != Some((cols, rows))
+                && request_terminal_resize(store, server, rows, cols).is_ok()
+            {
+                published_size = Some((cols, rows));
             }
-            let _ = request_terminal_resize(store, server, rows, cols);
             continue;
-        }
+        };
 
-        let read = stdin.read(&mut buf)?;
         if read == 0 {
             break;
         }
-        (cols, rows) = terminal::size().unwrap_or((cols, rows));
-        let _ = request_terminal_resize(store, server, rows, cols);
+        let (new_cols, new_rows) = terminal::size().unwrap_or((cols, rows));
+        (cols, rows) = (new_cols, new_rows);
+        if published_size != Some((cols, rows))
+            && request_terminal_resize(store, server, rows, cols).is_ok()
+        {
+            published_size = Some((cols, rows));
+        }
 
         let mut chunk_start = 0;
         for index in 0..read {
@@ -244,9 +305,7 @@ pub fn attach_terminal(store: &ConfigStore, server: &ServerConfig) -> Result<()>
 }
 
 /// Blocks until stdin has data ready to read or `timeout` elapses, returning
-/// whether data is ready. On platforms without a portable non-blocking
-/// readiness check, this simply reports ready immediately and callers fall
-/// back to a plain blocking read (matching the previous behavior there).
+/// whether data is ready.
 #[cfg(unix)]
 fn wait_stdin_ready(timeout: Duration) -> Result<bool> {
     let mut fds = [libc::pollfd {
@@ -266,23 +325,178 @@ fn wait_stdin_ready(timeout: Duration) -> Result<bool> {
     Ok(rc > 0)
 }
 
-#[cfg(not(unix))]
-fn wait_stdin_ready(_timeout: Duration) -> Result<bool> {
-    Ok(true)
+#[cfg(unix)]
+fn read_attach_input(
+    stdin: &mut impl Read,
+    buf: &mut [u8],
+    timeout: Duration,
+) -> Result<Option<usize>> {
+    if !wait_stdin_ready(timeout)? {
+        return Ok(None);
+    }
+    Ok(Some(stdin.read(buf)?))
 }
 
-fn wait_for_any_key(stdin: &mut impl Read) -> Result<()> {
-    let mut buf = [0_u8; 1];
-    loop {
-        if shutdown::requested() {
-            return Ok(());
-        }
-        if !wait_stdin_ready(ATTACH_POLL_INTERVAL)? {
-            continue;
-        }
-        let _ = stdin.read(&mut buf)?;
-        return Ok(());
+#[cfg(windows)]
+fn read_attach_input(
+    _stdin: &mut impl Read,
+    buf: &mut [u8],
+    timeout: Duration,
+) -> Result<Option<usize>> {
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    if !event::poll(timeout)? {
+        return Ok(None);
     }
+    let Event::Key(key) = event::read()? else {
+        return Ok(None);
+    };
+    if matches!(key.kind, KeyEventKind::Release) {
+        return Ok(None);
+    }
+    let input = windows_key_bytes(key);
+    let read = input.len().min(buf.len());
+    buf[..read].copy_from_slice(&input[..read]);
+    Ok((read > 0).then_some(read))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_attach_input(
+    stdin: &mut impl Read,
+    buf: &mut [u8],
+    _timeout: Duration,
+) -> Result<Option<usize>> {
+    Ok(Some(stdin.read(buf)?))
+}
+
+#[cfg(any(windows, test))]
+fn windows_key_bytes(key: crossterm::event::KeyEvent) -> Vec<u8> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    // Windows reports AltGr text as Ctrl+Alt plus the already composed
+    // character. Treat that combination as text, otherwise characters such
+    // as `@` and `\u{20ac}` would be rewritten as terminal control sequences.
+    let alt_gr_text = matches!(key.code, KeyCode::Char(_))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::ALT);
+    let mut bytes = Vec::new();
+    if key.modifiers.contains(KeyModifiers::ALT) && !alt_gr_text {
+        bytes.push(0x1b);
+    }
+
+    match key.code {
+        KeyCode::Char(ch) => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && !alt_gr_text {
+                let normalized = ch.to_ascii_lowercase();
+                let control = match normalized {
+                    '@' | ' ' | '2' => Some(0x00),
+                    'a'..='z' => Some(normalized as u8 - b'a' + 1),
+                    '[' | '3' => Some(0x1b),
+                    '\\' | '4' => Some(0x1c),
+                    ']' | '5' => Some(0x1d),
+                    '^' | '6' => Some(0x1e),
+                    '_' | '7' => Some(0x1f),
+                    '?' | '8' => Some(0x7f),
+                    _ => None,
+                };
+                if let Some(control) = control {
+                    bytes.push(control);
+                    return bytes;
+                }
+            }
+            let mut encoded = [0_u8; 4];
+            bytes.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
+        }
+        KeyCode::Backspace => bytes.push(0x7f),
+        KeyCode::Enter => bytes.push(b'\r'),
+        KeyCode::Tab => bytes.push(b'\t'),
+        KeyCode::BackTab => bytes.extend_from_slice(b"\x1b[Z"),
+        KeyCode::Esc => bytes.push(0x1b),
+        KeyCode::Up => bytes.extend_from_slice(b"\x1b[A"),
+        KeyCode::Down => bytes.extend_from_slice(b"\x1b[B"),
+        KeyCode::Right => bytes.extend_from_slice(b"\x1b[C"),
+        KeyCode::Left => bytes.extend_from_slice(b"\x1b[D"),
+        KeyCode::Home => bytes.extend_from_slice(b"\x1b[H"),
+        KeyCode::End => bytes.extend_from_slice(b"\x1b[F"),
+        KeyCode::Insert => bytes.extend_from_slice(b"\x1b[2~"),
+        KeyCode::Delete => bytes.extend_from_slice(b"\x1b[3~"),
+        KeyCode::PageUp => bytes.extend_from_slice(b"\x1b[5~"),
+        KeyCode::PageDown => bytes.extend_from_slice(b"\x1b[6~"),
+        KeyCode::F(number) => {
+            let sequence: &[u8] = match number {
+                1 => b"\x1bOP",
+                2 => b"\x1bOQ",
+                3 => b"\x1bOR",
+                4 => b"\x1bOS",
+                5 => b"\x1b[15~",
+                6 => b"\x1b[17~",
+                7 => b"\x1b[18~",
+                8 => b"\x1b[19~",
+                9 => b"\x1b[20~",
+                10 => b"\x1b[21~",
+                11 => b"\x1b[23~",
+                12 => b"\x1b[24~",
+                _ => b"",
+            };
+            bytes.extend_from_slice(sequence);
+        }
+        _ => {}
+    }
+    bytes
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum KeyWaitOutcome {
+    KeyPressed,
+    TimedOut,
+    Shutdown,
+}
+
+fn wait_for_key_until(
+    deadline: Instant,
+    mut now: impl FnMut() -> Instant,
+    mut poll_key: impl FnMut(Duration) -> Result<bool>,
+    mut shutdown_requested: impl FnMut() -> bool,
+) -> Result<KeyWaitOutcome> {
+    loop {
+        if shutdown_requested() {
+            return Ok(KeyWaitOutcome::Shutdown);
+        }
+
+        let Some(remaining) = deadline.checked_duration_since(now()) else {
+            return Ok(KeyWaitOutcome::TimedOut);
+        };
+        if remaining.is_zero() {
+            return Ok(KeyWaitOutcome::TimedOut);
+        }
+
+        if poll_key(remaining.min(ATTACH_POLL_INTERVAL))? {
+            return Ok(KeyWaitOutcome::KeyPressed);
+        }
+    }
+}
+
+fn wait_for_any_key(timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let _ = wait_for_key_until(
+        deadline,
+        Instant::now,
+        poll_and_consume_key,
+        shutdown::requested,
+    )?;
+    Ok(())
+}
+
+fn poll_and_consume_key(timeout: Duration) -> Result<bool> {
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    if !event::poll(timeout)? {
+        return Ok(false);
+    }
+    Ok(matches!(
+        event::read()?,
+        Event::Key(key) if !matches!(key.kind, KeyEventKind::Release)
+    ))
 }
 
 fn append_terminal_bytes(store: &ConfigStore, server: &ServerConfig, bytes: &[u8]) -> Result<()> {
@@ -310,33 +524,136 @@ fn append_terminal_bytes_to_queue(
     Ok(())
 }
 
-fn tail_terminal_output(path: PathBuf, mut offset: u64, done: Arc<AtomicBool>) {
+fn update_attach_log_marker(marker: &mut Vec<u8>, bytes: &[u8]) {
+    if bytes.len() >= ATTACH_LOG_MARKER_BYTES {
+        marker.clear();
+        marker.extend_from_slice(&bytes[bytes.len() - ATTACH_LOG_MARKER_BYTES..]);
+        return;
+    }
+
+    let keep = ATTACH_LOG_MARKER_BYTES.saturating_sub(bytes.len());
+    if marker.len() > keep {
+        marker.drain(..marker.len() - keep);
+    }
+    marker.extend_from_slice(bytes);
+}
+
+/// Opens the current log path at `offset` and verifies the small byte overlap
+/// immediately before it. A mismatch means the path was replaced or the file
+/// was truncated and regrown between polls, so the caller resumes from a
+/// bounded tail instead of replaying an arbitrarily large replacement file.
+fn open_attach_log(
+    path: &Path,
+    offset: u64,
+    expected_tail: &[u8],
+) -> io::Result<(File, bool, Vec<u8>, u64)> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    // A non-zero cursor without an overlap marker can happen when the initial
+    // replay raced a rotation or temporarily could not open the path. Its
+    // identity is unverified, so never apply that old cursor blindly to a new
+    // file that happens to be at least as large.
+    let identity_unverified = offset > 0 && expected_tail.is_empty();
+    if len < offset || expected_tail.len() as u64 > offset || identity_unverified {
+        let resume_offset = len.saturating_sub(ATTACH_REPLAY_BYTES);
+        file.seek(SeekFrom::Start(resume_offset))?;
+        return Ok((file, false, Vec::new(), resume_offset));
+    }
+
+    let marker_len = if expected_tail.is_empty() {
+        offset.min(ATTACH_LOG_MARKER_BYTES as u64) as usize
+    } else {
+        expected_tail.len()
+    };
+    let marker_start = offset - marker_len as u64;
+    file.seek(SeekFrom::Start(marker_start))?;
+    let mut actual_tail = vec![0_u8; marker_len];
+    file.read_exact(&mut actual_tail)?;
+    let prefix_matches = expected_tail.is_empty() || actual_tail == expected_tail;
+    let resume_offset = if prefix_matches {
+        offset
+    } else {
+        len.saturating_sub(ATTACH_REPLAY_BYTES)
+    };
+    file.seek(SeekFrom::Start(resume_offset))?;
+    Ok((file, prefix_matches, actual_tail, resume_offset))
+}
+
+fn tail_terminal_output(
+    path: PathBuf,
+    mut offset: u64,
+    mut tail_marker: Vec<u8>,
+    done: Arc<AtomicBool>,
+) {
     let mut stdout = io::stdout();
     let mut buf = [0_u8; 8192];
     // Decode before writing to the user's terminal: the server may log in a
     // legacy encoding (GBK, Shift_JIS, ...), and raw legacy bytes render as
     // mojibake on a UTF-8 terminal and fail outright on a Windows console.
     let mut decoder = StreamDecoder::new();
+    let mut file = None;
+    let mut reopened_at = None;
     while !done.load(Ordering::Relaxed) {
-        if let Ok(mut file) = File::open(&path) {
-            if let Ok(len) = file.metadata().map(|metadata| metadata.len()) {
-                if len < offset {
-                    offset = 0;
+        let should_reopen = reopened_at
+            .is_none_or(|checked: Instant| checked.elapsed() >= ATTACH_LOG_REOPEN_INTERVAL);
+        if should_reopen {
+            // During log rotation the path can briefly disappear. A failed
+            // open intentionally leaves an existing old handle in place;
+            // the next successful open verifies its marker before switching.
+            if let Ok((opened, prefix_matches, verified_tail, resume_offset)) =
+                open_attach_log(&path, offset, &tail_marker)
+            {
+                if !prefix_matches {
+                    offset = resume_offset;
+                    decoder = StreamDecoder::new();
+                    tail_marker.clear();
+                } else {
+                    tail_marker = verified_tail;
+                }
+                file = Some(opened);
+            }
+            // Missing or temporarily unreadable paths are retried at the same
+            // controlled cadence as normal identity checks, not every 50 ms.
+            reopened_at = Some(Instant::now());
+        }
+        let mut reopen = false;
+        if let Some(reader) = file.as_mut() {
+            let len = reader.metadata().map_or(offset, |metadata| metadata.len());
+            if len < offset {
+                offset = len.saturating_sub(ATTACH_REPLAY_BYTES);
+                decoder = StreamDecoder::new();
+                tail_marker.clear();
+                if reader.seek(SeekFrom::Start(offset)).is_err() {
+                    reopen = true;
                 }
             }
-            if file.seek(SeekFrom::Start(offset)).is_ok() {
+            if !reopen {
                 loop {
-                    match file.read(&mut buf) {
+                    if done.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
                             offset = offset.saturating_add(n as u64);
+                            update_attach_log_marker(&mut tail_marker, &buf[..n]);
                             let _ = stdout.write_all(decoder.push(&buf[..n]).as_bytes());
                             let _ = stdout.flush();
                         }
-                        Err(_) => break,
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                        Err(_) => {
+                            reopen = true;
+                            break;
+                        }
                     }
                 }
             }
+        }
+        if reopen {
+            file = None;
+        }
+        if done.load(Ordering::Relaxed) {
+            break;
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -344,26 +661,37 @@ fn tail_terminal_output(path: PathBuf, mut offset: u64, done: Arc<AtomicBool>) {
     let _ = stdout.flush();
 }
 
-fn replay_terminal_output(path: &Path, offset: u64) -> Result<()> {
+fn replay_terminal_output(path: &Path) -> Result<(u64, Vec<u8>)> {
+    replay_terminal_output_to(path, &mut io::stdout())
+}
+
+fn replay_terminal_output_to(path: &Path, output: &mut impl Write) -> Result<(u64, Vec<u8>)> {
     let mut file = match File::open(path) {
         Ok(file) => file,
-        Err(_) => return Ok(()),
+        Err(_) => return Ok((0, Vec::new())),
     };
-    file.seek(SeekFrom::Start(offset))?;
-    let mut stdout = io::stdout();
+    let len = file.metadata()?.len();
+    // Derive the tail cursor from this open handle so a path replacement
+    // cannot make metadata from an earlier lookup select the wrong range.
+    let mut cursor = len.saturating_sub(ATTACH_REPLAY_BYTES);
+    file.seek(SeekFrom::Start(cursor))?;
     let mut buf = [0_u8; 8192];
     let mut decoder = StreamDecoder::new();
+    let mut tail_marker = Vec::new();
+    let mut replay = file.take(len.saturating_sub(cursor));
     loop {
-        match file.read(&mut buf)? {
+        match replay.read(&mut buf)? {
             0 => break,
             n => {
-                stdout.write_all(decoder.push(&buf[..n]).as_bytes())?;
+                cursor = cursor.saturating_add(n as u64);
+                update_attach_log_marker(&mut tail_marker, &buf[..n]);
+                output.write_all(decoder.push(&buf[..n]).as_bytes())?;
             }
         }
     }
-    stdout.write_all(decoder.flush().as_bytes())?;
-    stdout.flush()?;
-    Ok(())
+    output.write_all(decoder.flush().as_bytes())?;
+    output.flush()?;
+    Ok((cursor, tail_marker))
 }
 
 struct AttachTerminalGuard {
@@ -378,10 +706,11 @@ impl AttachTerminalGuard {
         Ok(Self { output: None })
     }
 
-    fn start_output(&mut self, path: PathBuf, offset: u64) {
+    fn start_output(&mut self, path: PathBuf, offset: u64, tail_marker: Vec<u8>) {
         let done = Arc::new(AtomicBool::new(false));
         let output_done = Arc::clone(&done);
-        let output_thread = thread::spawn(move || tail_terminal_output(path, offset, output_done));
+        let output_thread =
+            thread::spawn(move || tail_terminal_output(path, offset, tail_marker, output_done));
         self.output = Some((done, output_thread));
     }
 
@@ -413,7 +742,10 @@ pub fn run_supervisor(store: &ConfigStore, server_id: &str) -> Result<()> {
         supervisor_pid_path(store, &server),
         std::process::id().to_string(),
     )?;
-    let _ = fs::remove_file(stop_flag_path(store, &server));
+    if stop_flag_path(store, &server).exists() {
+        cleanup_runtime(store, &server);
+        return Ok(());
+    }
 
     loop {
         let exit_code = run_server_once(store, &config.java_path, &server)?;
@@ -446,7 +778,9 @@ fn run_server_once(
         ));
     }
 
-    fs::write(command_path(store, server), b"")?;
+    let command_file = command_path(store, server);
+    fs::write(&command_file, b"")?;
+    let mut command_reader = File::open(&command_file)?;
 
     // Seed the PTY at the viewing terminal's size (published by
     // start_supervisor, or left over from the last attach) so JLine formats
@@ -494,19 +828,30 @@ fn run_server_once(
     fs::write(child_pid_path(store, server), child.id().to_string())?;
     let done = Arc::new(AtomicBool::new(false));
     let command_done = Arc::clone(&done);
-    let command_file = command_path(store, server);
     let resize_file = resize_path(store, server);
     let mut master_writer = master.try_clone()?;
     let command_thread = thread::spawn(move || {
-        let mut offset = 0;
         let mut size = None;
+        let mut resize_checked_at: Option<Instant> = None;
+        let mut command_buf = Vec::new();
+        let mut command_written = 0;
         while !command_done.load(Ordering::Relaxed) {
-            if let Ok(new_offset) =
-                pump_terminal_commands(&command_file, offset, &mut master_writer)
-            {
-                offset = new_offset;
+            let command_result = pump_terminal_commands(
+                &mut command_reader,
+                &mut command_buf,
+                &mut command_written,
+                &mut master_writer,
+            );
+            if command_result.is_err() {
+                break;
             }
-            let _ = pump_terminal_resize(&resize_file, &master_writer, &mut size);
+            let now = Instant::now();
+            if resize_checked_at
+                .is_none_or(|checked| now.duration_since(checked) >= RESIZE_POLL_INTERVAL)
+            {
+                let _ = pump_terminal_resize(&resize_file, &master_writer, &mut size);
+                resize_checked_at = Some(now);
+            }
             thread::sleep(COMMAND_POLL_INTERVAL);
         }
     });
@@ -556,7 +901,9 @@ fn run_server_once(
         ));
     }
 
-    fs::write(command_path(store, server), b"")?;
+    let command_file = command_path(store, server);
+    fs::write(&command_file, b"")?;
+    let mut command_reader = File::open(&command_file)?;
     let log = append_file(&minecraft_log_path(store, server))?;
     let stderr = log.try_clone()?;
 
@@ -574,13 +921,19 @@ fn run_server_once(
     fs::write(child_pid_path(store, server), child.id().to_string())?;
     let done = Arc::new(AtomicBool::new(false));
     let command_done = Arc::clone(&done);
-    let command_file = command_path(store, server);
     let mut stdin = child.stdin.take().context("open child stdin")?;
     let command_thread = thread::spawn(move || {
-        let mut offset = 0;
+        let mut command_buf = Vec::new();
+        let mut command_written = 0;
         while !command_done.load(Ordering::Relaxed) {
-            if let Ok(new_offset) = pump_commands(&command_file, offset, &mut stdin) {
-                offset = new_offset;
+            let command_result = pump_commands(
+                &mut command_reader,
+                &mut command_buf,
+                &mut command_written,
+                &mut stdin,
+            );
+            if command_result.is_err() {
+                break;
             }
             thread::sleep(COMMAND_POLL_INTERVAL);
         }
@@ -635,6 +988,15 @@ fn sanitize_terminal_bytes(input: &[u8]) -> Vec<u8> {
                 {
                     output.extend_from_slice(sequence);
                     index += consumed;
+                } else if input
+                    .get(index + 1)
+                    .is_none_or(|next| !matches!(*next, b'[' | b']' | b'O' | b'(' | b')'))
+                {
+                    // A standalone Escape and Alt+text are legitimate
+                    // terminal input. Structured CSI/OSC/SS3 sequences still
+                    // go through the allowlist above (or are dropped below).
+                    output.push(0x1b);
+                    index += 1;
                 } else {
                     index += skip_escape_bytes(&input[index..]).max(1);
                 }
@@ -643,7 +1005,7 @@ fn sanitize_terminal_bytes(input: &[u8]) -> Vec<u8> {
                 output.push(0x7f);
                 index += 1;
             }
-            b'\r' | b'\n' | b'\t' | 0x01..=0x1a | 0x1c..=0x1f | 0x7f => {
+            0x00..=0x1a | 0x1c..=0x1f | 0x7f => {
                 output.push(input[index]);
                 index += 1;
             }
@@ -653,9 +1015,6 @@ fn sanitize_terminal_bytes(input: &[u8]) -> Vec<u8> {
             }
             0x80..=0xff => {
                 output.push(input[index]);
-                index += 1;
-            }
-            _ => {
                 index += 1;
             }
         }
@@ -742,40 +1101,55 @@ fn shell_command(command_line: &str) -> Command {
 }
 
 #[cfg(not(unix))]
-fn pump_commands(path: &Path, offset: u64, stdin: &mut impl Write) -> Result<u64> {
-    if !path.exists() {
-        return Ok(offset);
+fn pump_commands(
+    file: &mut File,
+    buf: &mut Vec<u8>,
+    written: &mut usize,
+    stdin: &mut impl Write,
+) -> Result<()> {
+    if *written == buf.len() {
+        buf.clear();
+        *written = 0;
+        file.read_to_end(buf)?;
     }
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(offset))?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf)?;
-    if !buf.is_empty() {
-        stdin.write_all(buf.as_bytes())?;
-        stdin.flush()?;
-    }
-    Ok(offset + buf.len() as u64)
+    write_pending(buf, written, stdin)
 }
 
 #[cfg(unix)]
-fn pump_terminal_commands(path: &Path, offset: u64, terminal: &mut impl Write) -> Result<u64> {
-    if !path.exists() {
-        return Ok(offset);
+fn pump_terminal_commands(
+    file: &mut File,
+    buf: &mut Vec<u8>,
+    written: &mut usize,
+    terminal: &mut impl Write,
+) -> Result<()> {
+    if *written == buf.len() {
+        buf.clear();
+        *written = 0;
+        let read_result = file.read_to_end(buf);
+        for byte in &mut *buf {
+            if *byte == b'\n' {
+                *byte = b'\r';
+            }
+        }
+        read_result?;
     }
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(offset))?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
-    let read_len = buf.len();
+    write_pending(buf, written, terminal)
+}
+
+fn write_pending(buf: &[u8], written: &mut usize, output: &mut impl Write) -> Result<()> {
+    while *written < buf.len() {
+        match output.write(&buf[*written..]) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
+            Ok(count) => *written += count,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(err) => return Err(err.into()),
+        }
+    }
     if !buf.is_empty() {
-        let terminal_input = buf
-            .into_iter()
-            .map(|byte| if byte == b'\n' { b'\r' } else { byte })
-            .collect::<Vec<_>>();
-        terminal.write_all(&terminal_input)?;
-        terminal.flush()?;
+        output.flush()?;
     }
-    Ok(offset + read_len as u64)
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -784,10 +1158,11 @@ fn pump_terminal_resize(
     terminal: &File,
     last_size: &mut Option<(u16, u16)>,
 ) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let raw = fs::read_to_string(path)?;
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
     let mut parts = raw.split_whitespace();
     let Some(rows) = parts.next().and_then(|value| value.parse::<u16>().ok()) else {
         return Ok(());
@@ -962,11 +1337,11 @@ fn detach_from_terminal(command: &mut Command) {
 fn detach_from_terminal(_command: &mut Command) {}
 
 fn read_pid(path: &Path) -> Result<Option<u32>> {
-    if !path.exists() {
-        return Ok(None);
+    match fs::read_to_string(path) {
+        Ok(raw) => Ok(raw.trim().parse::<u32>().ok()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
     }
-    let raw = fs::read_to_string(path)?;
-    Ok(raw.trim().parse::<u32>().ok())
 }
 
 fn server_runtime_dir(store: &ConfigStore, server: &ServerConfig) -> PathBuf {
@@ -1052,7 +1427,317 @@ fn kill_pid(pid: u32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    #[test]
+    fn key_wait_returns_as_soon_as_a_key_is_ready() {
+        let start = Instant::now();
+        let polls = Cell::new(0);
+
+        let outcome = wait_for_key_until(
+            start + CONSOLE_EXIT_RETURN_TIMEOUT,
+            || start,
+            |timeout| {
+                assert_eq!(timeout, ATTACH_POLL_INTERVAL);
+                polls.set(polls.get() + 1);
+                Ok(true)
+            },
+            || false,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, KeyWaitOutcome::KeyPressed);
+        assert_eq!(polls.get(), 1);
+    }
+
+    #[test]
+    fn key_wait_caps_the_last_poll_at_the_deadline() {
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let polls = Cell::new(0);
+        let expected_waits = [
+            ATTACH_POLL_INTERVAL,
+            ATTACH_POLL_INTERVAL,
+            Duration::from_millis(50),
+        ];
+
+        let outcome = wait_for_key_until(
+            start + Duration::from_millis(450),
+            || clock.get(),
+            |timeout| {
+                assert_eq!(timeout, expected_waits[polls.get()]);
+                polls.set(polls.get() + 1);
+                clock.set(clock.get() + timeout);
+                Ok(false)
+            },
+            || false,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, KeyWaitOutcome::TimedOut);
+        assert_eq!(polls.get(), expected_waits.len());
+    }
+
+    #[test]
+    fn key_wait_honors_shutdown_between_input_polls() {
+        let start = Instant::now();
+        let polls = Cell::new(0);
+
+        let outcome = wait_for_key_until(
+            start + CONSOLE_EXIT_RETURN_TIMEOUT,
+            || start,
+            |_| {
+                polls.set(polls.get() + 1);
+                Ok(false)
+            },
+            || polls.get() > 0,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, KeyWaitOutcome::Shutdown);
+        assert_eq!(polls.get(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_command_reader_keeps_its_cursor_between_appends() {
+        let directory =
+            std::env::temp_dir().join(format!("remiaft-command-reader-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("commands.in");
+        fs::write(&path, b"say one\n").unwrap();
+
+        let mut reader = File::open(&path).unwrap();
+        let mut read_buf = Vec::new();
+        let mut written = 0;
+        let mut terminal = Vec::new();
+        pump_terminal_commands(&mut reader, &mut read_buf, &mut written, &mut terminal).unwrap();
+        assert_eq!(terminal, b"say one\r");
+
+        pump_terminal_commands(&mut reader, &mut read_buf, &mut written, &mut terminal).unwrap();
+        assert_eq!(terminal, b"say one\r");
+
+        let mut writer = OpenOptions::new().append(true).open(&path).unwrap();
+        writer.write_all(b"say two\n").unwrap();
+        writer.flush().unwrap();
+        pump_terminal_commands(&mut reader, &mut read_buf, &mut written, &mut terminal).unwrap();
+        assert_eq!(terminal, b"say one\rsay two\r");
+
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn pending_command_bytes_resume_after_would_block() {
+        struct WouldBlockOnce {
+            phase: u8,
+            bytes: Vec<u8>,
+        }
+
+        impl Write for WouldBlockOnce {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                match self.phase {
+                    0 => {
+                        let count = buf.len().min(2);
+                        self.bytes.extend_from_slice(&buf[..count]);
+                        self.phase = 1;
+                        Ok(count)
+                    }
+                    1 => {
+                        self.phase = 2;
+                        Err(io::Error::from(io::ErrorKind::WouldBlock))
+                    }
+                    _ => {
+                        self.bytes.extend_from_slice(buf);
+                        Ok(buf.len())
+                    }
+                }
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut output = WouldBlockOnce {
+            phase: 0,
+            bytes: Vec::new(),
+        };
+        let mut written = 0;
+        write_pending(b"abcdef", &mut written, &mut output).unwrap();
+        assert_eq!(written, 2);
+        assert_eq!(output.bytes, b"ab");
+
+        write_pending(b"abcdef", &mut written, &mut output).unwrap();
+        assert_eq!(written, 6);
+        assert_eq!(output.bytes, b"abcdef");
+    }
+
+    #[test]
+    fn attach_log_reopen_verifies_its_previous_tail() {
+        let directory =
+            std::env::temp_dir().join(format!("remiaft-attach-log-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("minecraft.log");
+        fs::write(&path, b"abcdef").unwrap();
+
+        let expected_marker = b"abcdef";
+        let (_, prefix_matches, mut marker, _) =
+            open_attach_log(&path, 6, expected_marker).unwrap();
+        assert!(prefix_matches);
+        assert_eq!(marker, b"abcdef");
+
+        let mut writer = OpenOptions::new().append(true).open(&path).unwrap();
+        writer.write_all(b"gh").unwrap();
+        writer.flush().unwrap();
+        let (mut reader, prefix_matches, _, _) = open_attach_log(&path, 6, &marker).unwrap();
+        assert!(prefix_matches);
+        let mut appended = Vec::new();
+        reader.read_to_end(&mut appended).unwrap();
+        assert_eq!(appended, b"gh");
+        update_attach_log_marker(&mut marker, &appended);
+
+        drop(reader);
+        drop(writer);
+        let replacement_len = ATTACH_REPLAY_BYTES as usize + 10;
+        fs::write(&path, vec![b'x'; replacement_len]).unwrap();
+        let (_, prefix_matches, _, resume_offset) = open_attach_log(&path, 8, &marker).unwrap();
+        assert!(!prefix_matches);
+        assert_eq!(resume_offset, 10);
+
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn attach_log_does_not_trust_a_nonzero_cursor_without_a_marker() {
+        let directory = std::env::temp_dir().join(format!(
+            "remiaft-attach-unverified-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("minecraft.log");
+        let replacement_len = ATTACH_REPLAY_BYTES as usize + 20;
+        fs::write(&path, vec![b'x'; replacement_len]).unwrap();
+
+        let (_, prefix_matches, marker, resume_offset) = open_attach_log(&path, 10, &[]).unwrap();
+        assert!(!prefix_matches);
+        assert!(marker.is_empty());
+        assert_eq!(resume_offset, 20);
+
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn attach_tail_starts_after_every_byte_replayed() {
+        let directory =
+            std::env::temp_dir().join(format!("remiaft-attach-replay-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("minecraft.log");
+        fs::write(&path, b"history").unwrap();
+
+        let mut replayed = Vec::new();
+        let (replay_end, marker) = replay_terminal_output_to(&path, &mut replayed).unwrap();
+        assert_eq!(replayed, b"history");
+        assert_eq!(replay_end, 7);
+        assert_eq!(marker, b"history");
+
+        let mut writer = OpenOptions::new().append(true).open(&path).unwrap();
+        writer.write_all(b"new").unwrap();
+        writer.flush().unwrap();
+        let (mut reader, prefix_matches, _, resume_offset) =
+            open_attach_log(&path, replay_end, &marker).unwrap();
+        assert!(prefix_matches);
+        assert_eq!(resume_offset, replay_end);
+        let mut appended = Vec::new();
+        reader.read_to_end(&mut appended).unwrap();
+        assert_eq!(appended, b"new");
+
+        drop(reader);
+        drop(writer);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn attach_replay_is_bounded_and_keeps_a_rolling_marker() {
+        let directory = std::env::temp_dir().join(format!(
+            "remiaft-attach-bounded-replay-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("minecraft.log");
+        let len = ATTACH_REPLAY_BYTES as usize + 10;
+        let bytes = (0..len)
+            .map(|index| b'a' + (index % 26) as u8)
+            .collect::<Vec<_>>();
+        fs::write(&path, &bytes).unwrap();
+
+        let mut replayed = Vec::new();
+        let (replay_end, marker) = replay_terminal_output_to(&path, &mut replayed).unwrap();
+        assert_eq!(replay_end, len as u64);
+        assert_eq!(replayed, bytes[10..]);
+        assert_eq!(marker, bytes[len - ATTACH_LOG_MARKER_BYTES..]);
+
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn windows_keys_are_encoded_as_terminal_input() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        assert_eq!(
+            windows_key_bytes(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            [0x03]
+        );
+        assert_eq!(
+            windows_key_bytes(KeyEvent::new(KeyCode::Char('服'), KeyModifiers::NONE)),
+            "服".as_bytes()
+        );
+        assert_eq!(
+            windows_key_bytes(KeyEvent::new(
+                KeyCode::Char('@'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            )),
+            b"@"
+        );
+        assert_eq!(
+            windows_key_bytes(KeyEvent::new(
+                KeyCode::Char('\u{20ac}'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            )),
+            "\u{20ac}".as_bytes()
+        );
+        assert_eq!(
+            windows_key_bytes(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            b"\x1b[D"
+        );
+        assert_eq!(
+            sanitize_terminal_bytes(&windows_key_bytes(KeyEvent::new(
+                KeyCode::Char('b'),
+                KeyModifiers::ALT,
+            ))),
+            b"\x1bb"
+        );
+        assert_eq!(
+            sanitize_terminal_bytes(&windows_key_bytes(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            ))),
+            [0x1b]
+        );
+        assert_eq!(
+            sanitize_terminal_bytes(&windows_key_bytes(KeyEvent::new(
+                KeyCode::Char(' '),
+                KeyModifiers::CONTROL,
+            ))),
+            [0x00]
+        );
+    }
 
     #[test]
     fn terminal_guard_stops_output_on_drop() {
@@ -1105,10 +1790,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_input_drops_disallowed_command_text() {
-        assert_eq!(
-            sanitize_text("say \u{a7}red\u{1b}bad\u{7f}\r"),
-            "say redad\u{7f}\r"
-        );
+    fn terminal_input_drops_minecraft_formatting_marker() {
+        assert_eq!(sanitize_text("say \u{a7}red\u{7f}\r"), "say red\u{7f}\r");
     }
 }

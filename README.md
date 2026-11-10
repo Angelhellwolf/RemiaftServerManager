@@ -55,11 +55,12 @@ On first launch, `remiaft` asks for the interface language and saves it in the
 user config. English and Simplified Chinese are supported now; press `l` in the
 TUI to change language later.
 
-Inside the TUI, press `?` (or F1) for the full shortcut list. The main screen
-is a server tree on the left and the selected server's live log plus a compact
-detail strip on the right. Start/stop/restart run in the background, so the UI
-never freezes while a server shuts down; the tree shows a transient
-`stopping...` state instead.
+Inside the TUI, press `?` (or F1) for the full shortcut list; the help window
+closes automatically after 10 seconds. The main screen is a responsive server
+tree and dashboard summary with the selected server's live log plus a compact
+detail strip. Start/stop/restart run in the background, so the UI never freezes
+while a server shuts down; the tree shows a transient `stopping...` state
+instead.
 
 ```text
 ? or F1 show all shortcuts
@@ -68,6 +69,7 @@ o attach a native console for the selected running server
 type directly in the native console; Tab, arrows, and editing keys go to the server
 Ctrl-C in the native console sends an interrupt to the selected server
 Ctrl-U detaches from the native console without stopping the server
+when the server exits, the native console returns automatically after 5 seconds
 b show/hide the detail strip
 use your terminal scrollback for attached console history
 n add server
@@ -76,7 +78,7 @@ x stop selected server
 r restart selected server
 c send console command
 a toggle auto-restart
-d delete selected server/group
+Ctrl+D, then type the exact name and press Enter to delete the selected server/group
 q quit
 ```
 
