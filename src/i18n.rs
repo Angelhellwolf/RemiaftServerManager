@@ -93,6 +93,15 @@ pub enum Text {
     OpStopping,
     OpRestarting,
     CompletionAmbiguousHint,
+    Total,
+    Issues,
+    Version,
+    Jar,
+    RestartDelay,
+    CommandShort,
+    AutoShort,
+    On,
+    Off,
 }
 
 pub fn text(language: Language, key: Text) -> &'static str {
@@ -114,7 +123,7 @@ fn english(key: Text) -> &'static str {
         Text::Details => "Details",
         Text::Shortcuts => "Shortcuts",
         Text::FooterHints => "? help · n new · o console · q quit",
-        Text::HelpHint => "press any key to close",
+        Text::HelpHint => "press any key to close · auto-closes in 10s",
         Text::SelectedServer => "Selected group",
         Text::ConsoleFollow => "follow",
         Text::ConsolePaused => "paused, End resumes",
@@ -169,6 +178,15 @@ fn english(key: Text) -> &'static str {
         Text::OpStopping => "stopping...",
         Text::OpRestarting => "restarting...",
         Text::CompletionAmbiguousHint => "ambiguous completion, press Tab again to list matches",
+        Text::Total => "Total",
+        Text::Issues => "Issues",
+        Text::Version => "Version",
+        Text::Jar => "Jar",
+        Text::RestartDelay => "Delay",
+        Text::CommandShort => "Cmd",
+        Text::AutoShort => "Restart",
+        Text::On => "on",
+        Text::Off => "off",
     }
 }
 
@@ -184,7 +202,7 @@ fn chinese_simplified(key: Text) -> &'static str {
         Text::Details => "详情",
         Text::Shortcuts => "快捷键",
         Text::FooterHints => "? 帮助 · n 新建 · o 控制台 · q 退出",
-        Text::HelpHint => "按任意键关闭",
+        Text::HelpHint => "按任意键关闭 · 10 秒后自动关闭",
         Text::SelectedServer => "当前分组",
         Text::ConsoleFollow => "跟随中",
         Text::ConsolePaused => "已暂停，End 恢复",
@@ -237,5 +255,14 @@ fn chinese_simplified(key: Text) -> &'static str {
         Text::OpStopping => "停止中...",
         Text::OpRestarting => "重启中...",
         Text::CompletionAmbiguousHint => "补全不唯一，再按一次 Tab 列出所有匹配项",
+        Text::Total => "总数",
+        Text::Issues => "异常",
+        Text::Version => "版本",
+        Text::Jar => "Jar",
+        Text::RestartDelay => "延迟",
+        Text::CommandShort => "命令",
+        Text::AutoShort => "重启",
+        Text::On => "开",
+        Text::Off => "关",
     }
 }

@@ -9,7 +9,7 @@ use crossterm::terminal::{
     LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::{Frame, Terminal};
 
 pub(super) struct TerminalGuard {
@@ -36,9 +36,13 @@ impl TerminalGuard {
 
     pub(super) fn draw<F>(&mut self, f: F) -> Result<()>
     where
-        F: FnOnce(&mut Frame),
+        F: FnOnce(&mut Frame) -> Option<Position>,
     {
-        self.terminal.draw(f)?;
+        self.terminal.draw(|frame| {
+            if let Some(position) = f(frame) {
+                frame.set_cursor_position(position);
+            }
+        })?;
         Ok(())
     }
 
@@ -61,7 +65,7 @@ impl TerminalGuard {
             cursor::MoveTo(0, 0),
             LeaveAlternateScreen
         )?;
-        self.terminal.backend_mut().flush()?;
+        Write::flush(self.terminal.backend_mut())?;
         disable_raw_mode()?;
         Ok(())
     }

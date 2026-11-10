@@ -2,16 +2,19 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read as _, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 
 use crate::config::{ConfigStore, RemiaftConfig, ServerConfig};
+use crate::encoding::StreamDecoder;
 use crate::i18n::{self, Language, Text};
 use crate::process;
 use crate::shutdown;
@@ -34,33 +37,136 @@ use terminal::TerminalGuard;
 const MAX_CONSOLE_LINES: usize = 2_000;
 /// Only read the tail of the server log; the embedded panel never shows more.
 const LOG_TAIL_BYTES: u64 = 512 * 1024;
+/// A small overlap verifies that an incremental read still follows the same
+/// file contents after rotations or a fast truncate-and-regrow.
+const LOG_TAIL_MARKER_BYTES: usize = 64;
+/// Runtime state changes much less frequently than terminal input. Keeping a
+/// short-lived snapshot avoids opening every PID file several times per frame.
+const RUNTIME_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
+/// Limit metadata polling for the selected log while keeping live output
+/// responsive enough for an interactive dashboard.
+const CONSOLE_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const UI_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const HELP_WINDOW_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn is_delete_shortcut(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+#[cfg(unix)]
+fn has_terminal_hangup(revents: libc::c_short) -> bool {
+    revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+}
+
+#[cfg(unix)]
+fn terminal_input_hung_up() -> std::io::Result<bool> {
+    let mut descriptor = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    Ok(result > 0 && has_terminal_hangup(descriptor.revents))
+}
+
+#[cfg(not(unix))]
+fn terminal_input_hung_up() -> std::io::Result<bool> {
+    Ok(false)
+}
+
+fn window_expired(opened_at: Option<Instant>, now: Instant, timeout: Duration) -> bool {
+    opened_at.is_some_and(|opened| now.saturating_duration_since(opened) >= timeout)
+}
 
 pub async fn run(store: ConfigStore) -> Result<()> {
     let mut terminal = TerminalGuard::enter()?;
     let mut app = App::new(store)?;
+    let mut needs_draw = true;
+    let mut needs_layout = true;
+    let mut last_size = None;
+    // The language picker does not depend on server state. The normal screen
+    // does: wait for its first asynchronous runtime snapshot so the terminal
+    // receives one complete initial frame instead of an empty frame followed
+    // immediately by a large differential update. Some SSH clients, notably
+    // Xshell under load, can otherwise display only the second update.
+    let mut initial_frame_ready = matches!(app.mode, Mode::LanguageSelect);
 
     loop {
-        if shutdown::requested() {
+        // A disconnected SSH/web terminal leaves its PTY descriptors open in
+        // this process, but poll then reports HUP immediately. Without this
+        // check the TUI loops at 100% CPU forever after its terminal vanishes.
+        if shutdown::requested() || terminal_input_hung_up()? {
             break;
         }
-        app.drain_op_messages();
-        app.refresh_console();
-        let size = terminal.size()?;
-        app.update_console_layout(size);
-        app.ensure_wrapped();
+
+        let operation_changed = app.drain_op_messages();
+        needs_draw |= operation_changed;
+        needs_draw |= app.refresh_external_config();
+        needs_draw |= app.close_expired_windows();
+        needs_draw |= app.refresh_pending_ops();
+        needs_draw |= app.refresh_runtime_statuses(operation_changed);
+        if !initial_frame_ready && app.runtime_status_snapshot_ready() {
+            initial_frame_ready = true;
+            needs_draw = true;
+        }
+        needs_draw |= app.refresh_console();
+        if needs_layout {
+            let size = terminal.size()?;
+            if last_size != Some(size) {
+                app.update_console_layout(size);
+                last_size = Some(size);
+                needs_draw = true;
+            }
+            needs_layout = false;
+        }
+        needs_draw |= app.ensure_wrapped();
         if app.take_screen_clear() {
             terminal.clear()?;
+            needs_draw = true;
         }
-        terminal.draw(|frame| render::draw(frame, &app))?;
-        if event::poll(Duration::from_millis(200))? {
+        if needs_draw && initial_frame_ready {
+            terminal.draw(|frame| render::draw(frame, &app))?;
+            needs_draw = false;
+        }
+        let poll_interval = if initial_frame_ready {
+            UI_POLL_INTERVAL
+        } else {
+            Duration::from_millis(20)
+        };
+        let event_ready = event::poll(poll_interval)?;
+        // The PTY can disappear while poll is blocked. Check again before
+        // entering crossterm's read path; optimized builds can otherwise
+        // spin inside event::read forever on a hung-up descriptor.
+        if terminal_input_hung_up()? {
+            break;
+        }
+        if event_ready {
             match event::read()? {
-                Event::Key(key) => {
+                Event::Key(key) if !matches!(key.kind, KeyEventKind::Release) => {
                     if app.handle_key(key)? {
                         break;
                     }
+                    needs_draw = true;
                 }
-                Event::Mouse(mouse) => app.handle_mouse(mouse),
-                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
+                Event::Key(_) => {}
+                Event::Mouse(mouse) => {
+                    app.handle_mouse(mouse);
+                    needs_draw = true;
+                }
+                Event::Resize(_, _) | Event::FocusGained => {
+                    needs_layout = true;
+                    needs_draw = true;
+                }
+                Event::FocusLost | Event::Paste(_) => {}
             }
         }
         if let Some(server) = app.take_console_attach_request() {
@@ -72,6 +178,10 @@ pub async fn run(store: ConfigStore) -> Result<()> {
                 Ok(()) => app.t(Text::Help).to_string(),
                 Err(err) => format!("console attach failed: {err}"),
             };
+            app.invalidate_runtime_statuses();
+            app.invalidate_console();
+            needs_layout = true;
+            needs_draw = true;
         }
     }
 
@@ -94,6 +204,7 @@ enum Mode {
     AddGroup,
     MoveToGroup,
     Command,
+    DeleteConfirm,
 }
 
 /// Lifecycle operation currently running for a server in a background
@@ -150,6 +261,8 @@ struct TreeRow {
 struct App {
     store: ConfigStore,
     config: RemiaftConfig,
+    config_signature: Option<(u64, SystemTime)>,
+    config_checked_at: Option<Instant>,
     selected: usize,
     expanded_groups: HashSet<String>,
     marked_servers: HashSet<String>,
@@ -161,14 +274,26 @@ struct App {
     status: String,
     show_details: bool,
     show_help: bool,
+    help_opened_at: Option<Instant>,
     console_server_id: Option<String>,
     console_lines: Vec<String>,
     console_wrapped: Vec<String>,
     console_dirty: bool,
+    console_decoder: StreamDecoder,
+    console_decoder_preview: Option<String>,
+    console_has_partial_line: bool,
     console_last_len: Option<u64>,
+    console_last_modified: Option<SystemTime>,
+    console_tail_marker: Vec<u8>,
+    console_checked_at: Option<Instant>,
     console_end: Option<usize>,
     console_follow: bool,
     console_wrap_width: usize,
+    runtime_statuses: HashMap<String, process::RuntimeStatus>,
+    runtime_status_checked_at: Option<Instant>,
+    runtime_status_scan: Option<mpsc::Receiver<HashMap<String, process::RuntimeStatus>>>,
+    runtime_status_refresh_pending: bool,
+    pending_ops: HashMap<String, PendingOp>,
     console_attach_request: Option<ServerConfig>,
     needs_screen_clear: bool,
     tab_state: TabState,
@@ -178,6 +303,7 @@ struct App {
 impl App {
     fn new(store: ConfigStore) -> Result<Self> {
         let config = store.load()?;
+        let config_signature = store.signature();
         let expanded_groups = HashSet::new();
         let saved_language = config.language.as_deref().and_then(Language::from_code);
         let language = saved_language.unwrap_or(Language::English);
@@ -189,6 +315,8 @@ impl App {
         Ok(Self {
             store,
             config,
+            config_signature,
+            config_checked_at: None,
             selected: 0,
             expanded_groups,
             marked_servers: HashSet::new(),
@@ -204,14 +332,26 @@ impl App {
             status: i18n::text(language, Text::Help).to_string(),
             show_details: true,
             show_help: false,
+            help_opened_at: None,
             console_server_id: None,
             console_lines: Vec::new(),
             console_wrapped: Vec::new(),
             console_dirty: false,
+            console_decoder: StreamDecoder::new(),
+            console_decoder_preview: None,
+            console_has_partial_line: false,
             console_last_len: None,
+            console_last_modified: None,
+            console_tail_marker: Vec::new(),
+            console_checked_at: None,
             console_end: None,
             console_follow: true,
             console_wrap_width: 120,
+            runtime_statuses: HashMap::new(),
+            runtime_status_checked_at: None,
+            runtime_status_scan: None,
+            runtime_status_refresh_pending: false,
+            pending_ops: HashMap::new(),
             console_attach_request: None,
             needs_screen_clear: false,
             tab_state: TabState::default(),
@@ -219,9 +359,101 @@ impl App {
         })
     }
 
+    fn refresh_external_config(&mut self) -> bool {
+        if !matches!(self.mode, Mode::Normal)
+            || self
+                .config_checked_at
+                .is_some_and(|checked| checked.elapsed() < CONFIG_REFRESH_INTERVAL)
+        {
+            return false;
+        }
+        self.config_checked_at = Some(Instant::now());
+        let signature = self.store.signature();
+        if signature == self.config_signature {
+            return false;
+        }
+
+        let selected_server_id = self.selected().map(|server| server.id.clone());
+        let selected_group_id = self.selected_group_id();
+        let previous_server_ids = self
+            .config
+            .servers
+            .iter()
+            .map(|server| server.id.clone())
+            .collect::<HashSet<_>>();
+        let Ok(config) = self.store.load() else {
+            return false;
+        };
+        self.config = config;
+        self.config_signature = self.store.signature();
+
+        let valid_group_ids = self
+            .config
+            .groups
+            .iter()
+            .map(|group| group.id.clone())
+            .collect::<HashSet<_>>();
+        self.expanded_groups
+            .retain(|group_id| valid_group_ids.contains(group_id));
+        let valid_server_ids = self
+            .config
+            .servers
+            .iter()
+            .map(|server| server.id.clone())
+            .collect::<HashSet<_>>();
+        self.marked_servers
+            .retain(|server_id| valid_server_ids.contains(server_id));
+
+        let new_group_ids = self
+            .config
+            .servers
+            .iter()
+            .filter(|server| !previous_server_ids.contains(&server.id))
+            .filter_map(|server| server.group_id.clone())
+            .collect::<Vec<_>>();
+        for group_id in new_group_ids {
+            self.expand_group_chain(&group_id);
+        }
+
+        let rows = self.visible_tree();
+        self.selected = rows
+            .iter()
+            .position(|row| match &row.item {
+                TreeItem::Server(index) => selected_server_id
+                    .as_ref()
+                    .is_some_and(|id| self.config.servers[*index].id == *id),
+                TreeItem::Group(id) => selected_group_id.as_ref() == Some(id),
+            })
+            .unwrap_or_else(|| self.selected.min(rows.len().saturating_sub(1)));
+        self.invalidate_runtime_statuses();
+        self.invalidate_console();
+        self.status = match self.language {
+            Language::English => "server list updated".to_string(),
+            Language::ChineseSimplified => "服务器列表已更新".to_string(),
+        };
+        true
+    }
+
+    fn expand_group_chain(&mut self, group_id: &str) {
+        let mut current = Some(group_id.to_string());
+        while let Some(id) = current {
+            self.expanded_groups.insert(id.clone());
+            current = self
+                .config
+                .groups
+                .iter()
+                .find(|group| group.id == id)
+                .and_then(|group| group.parent_id.clone());
+        }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
         if self.show_help {
+            if matches!(key.kind, KeyEventKind::Repeat) {
+                return Ok(false);
+            }
             self.show_help = false;
+            self.help_opened_at = None;
             return Ok(false);
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -261,9 +493,26 @@ impl App {
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if matches!(key.kind, KeyEventKind::Repeat)
+            && !matches!(
+                key.code,
+                KeyCode::Down
+                    | KeyCode::Up
+                    | KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Char('k')
+            )
+        {
+            return Ok(false);
+        }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
-            KeyCode::Char('?') | KeyCode::F(1) => self.show_help = true,
+            KeyCode::Char('?') | KeyCode::F(1) => {
+                self.show_help = true;
+                self.help_opened_at = Some(Instant::now());
+            }
             KeyCode::F(2) => self.begin_add_group(),
             KeyCode::F(3) => self.begin_move_to_group(),
             KeyCode::F(5) => self.start_targets(),
@@ -282,7 +531,15 @@ impl App {
                 self.clear_input();
                 self.status = self.t(Text::ServerNamePrompt).to_string();
             }
-            KeyCode::Char('d') => self.delete_selected()?,
+            KeyCode::Char('d') | KeyCode::Char('D') if is_delete_shortcut(&key) => {
+                self.begin_delete_confirmation()
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                self.status = match self.language {
+                    Language::English => "deletion requires Ctrl+D".to_string(),
+                    Language::ChineseSimplified => "删除需同时按 Ctrl+D".to_string(),
+                };
+            }
             KeyCode::Char('s') => self.start_selected(),
             KeyCode::Char('x') => self.stop_selected(),
             KeyCode::Char('r') => self.restart_selected(),
@@ -303,6 +560,10 @@ impl App {
             }
             _ => {}
         }
+        let console_server_after = self.selected().map(|server| server.id.clone());
+        if self.console_server_id.as_deref() != console_server_after.as_deref() {
+            self.invalidate_console();
+        }
         Ok(false)
     }
 
@@ -316,7 +577,10 @@ impl App {
                 self.clear_input();
                 self.status = self.t(Text::Cancelled).to_string();
             }
-            KeyCode::Enter => self.commit_input()?,
+            KeyCode::Enter => {
+                self.commit_input()?;
+                self.invalidate_console();
+            }
             KeyCode::Left => move_cursor_left(&self.input, &mut self.input_cursor),
             KeyCode::Right => move_cursor_right(&self.input, &mut self.input_cursor),
             KeyCode::Up | KeyCode::Home => self.input_cursor = 0,
@@ -489,7 +753,10 @@ impl App {
                 } else {
                     self.config.ensure_group_path(&path)
                 };
-                let ids = self.marked_or_selected_server_ids();
+                let ids = self
+                    .marked_or_selected_server_ids()
+                    .into_iter()
+                    .collect::<HashSet<_>>();
                 let count = ids.len();
                 for server in &mut self.config.servers {
                     if ids.contains(&server.id) {
@@ -516,6 +783,34 @@ impl App {
                 }
                 self.clear_input();
                 self.mode = Mode::Normal;
+            }
+            Mode::DeleteConfirm => {
+                let expected = if let Some(server) = self.selected() {
+                    Some(server.name.clone())
+                } else if let Some(group_id) = self.selected_group_id() {
+                    self.config
+                        .groups
+                        .iter()
+                        .find(|group| group.id == group_id)
+                        .map(|group| group.name.clone())
+                } else {
+                    None
+                };
+                let confirmed = expected
+                    .as_deref()
+                    .is_some_and(|name| self.input.trim() == name);
+                self.clear_input();
+                self.mode = Mode::Normal;
+                if confirmed {
+                    self.delete_selected()?;
+                } else {
+                    self.status = match self.language {
+                        Language::English => {
+                            "confirmation did not match; nothing deleted".to_string()
+                        }
+                        Language::ChineseSimplified => "名称不匹配，未删除任何内容".to_string(),
+                    };
+                }
             }
             Mode::LanguageSelect | Mode::Normal => {}
         }
@@ -561,44 +856,73 @@ impl App {
     }
 
     fn visible_tree(&self) -> Vec<TreeRow> {
-        let mut rows = Vec::new();
-        self.push_tree_children(None, 0, &mut rows);
-        rows
-    }
-
-    fn push_tree_children(&self, parent_id: Option<&str>, depth: usize, rows: &mut Vec<TreeRow>) {
-        for group in self
-            .config
-            .groups
-            .iter()
-            .filter(|group| group.parent_id.as_deref() == parent_id)
-        {
-            rows.push(TreeRow {
-                depth,
-                item: TreeItem::Group(group.id.clone()),
-            });
-            if self.expanded_groups.contains(&group.id) {
-                self.push_tree_children(Some(&group.id), depth + 1, rows);
+        fn append_rows(
+            parent_id: Option<&str>,
+            depth: usize,
+            groups_by_parent: &HashMap<Option<&str>, Vec<&crate::config::ServerGroup>>,
+            servers_by_parent: &HashMap<Option<&str>, Vec<usize>>,
+            expanded_groups: &HashSet<String>,
+            rows: &mut Vec<TreeRow>,
+        ) {
+            if let Some(groups) = groups_by_parent.get(&parent_id) {
+                for group in groups {
+                    rows.push(TreeRow {
+                        depth,
+                        item: TreeItem::Group(group.id.clone()),
+                    });
+                    if expanded_groups.contains(&group.id) {
+                        append_rows(
+                            Some(group.id.as_str()),
+                            depth + 1,
+                            groups_by_parent,
+                            servers_by_parent,
+                            expanded_groups,
+                            rows,
+                        );
+                    }
+                }
+            }
+            if let Some(indices) = servers_by_parent.get(&parent_id) {
+                rows.extend(indices.iter().map(|index| TreeRow {
+                    depth,
+                    item: TreeItem::Server(*index),
+                }));
             }
         }
 
-        for (index, _server) in self
+        let group_ids = self
             .config
-            .servers
+            .groups
             .iter()
-            .enumerate()
-            .filter(|(_, server)| {
-                let group_exists = server.group_id.as_ref().is_some_and(|group_id| {
-                    self.config.groups.iter().any(|group| &group.id == group_id)
-                });
-                server.group_id.as_deref() == parent_id || (parent_id.is_none() && !group_exists)
-            })
-        {
-            rows.push(TreeRow {
-                depth,
-                item: TreeItem::Server(index),
-            });
+            .map(|group| group.id.as_str())
+            .collect::<HashSet<_>>();
+        let mut groups_by_parent: HashMap<Option<&str>, Vec<&crate::config::ServerGroup>> =
+            HashMap::new();
+        for group in &self.config.groups {
+            groups_by_parent
+                .entry(group.parent_id.as_deref())
+                .or_default()
+                .push(group);
         }
+        let mut servers_by_parent: HashMap<Option<&str>, Vec<usize>> = HashMap::new();
+        for (index, server) in self.config.servers.iter().enumerate() {
+            let parent_id = match server.group_id.as_deref() {
+                Some(group_id) if group_ids.contains(group_id) => Some(group_id),
+                _ => None,
+            };
+            servers_by_parent.entry(parent_id).or_default().push(index);
+        }
+
+        let mut rows = Vec::with_capacity(self.config.groups.len() + self.config.servers.len());
+        append_rows(
+            None,
+            0,
+            &groups_by_parent,
+            &servers_by_parent,
+            &self.expanded_groups,
+            &mut rows,
+        );
+        rows
     }
 
     fn clamp_selection(&mut self) {
@@ -623,6 +947,33 @@ impl App {
             self.delete_group(&group_id)?;
         }
         Ok(())
+    }
+
+    fn begin_delete_confirmation(&mut self) {
+        let target = if let Some(server) = self.selected() {
+            Some(server.name.clone())
+        } else if let Some(group_id) = self.selected_group_id() {
+            self.config
+                .groups
+                .iter()
+                .find(|group| group.id == group_id)
+                .map(|group| group.name.clone())
+        } else {
+            None
+        };
+        let Some(target) = target else {
+            return;
+        };
+        self.clear_input();
+        self.mode = Mode::DeleteConfirm;
+        self.status = match self.language {
+            Language::English => {
+                format!("type the exact name `{target}` and press Enter to delete")
+            }
+            Language::ChineseSimplified => {
+                format!("二次确认：输入完整名称 `{target}` 后按 Enter 才会删除")
+            }
+        };
     }
 
     fn delete_group(&mut self, group_id: &str) -> Result<()> {
@@ -729,25 +1080,108 @@ impl App {
         });
     }
 
-    fn drain_op_messages(&mut self) {
-        let mut messages = self.ops.messages.lock().expect("ops lock");
-        if let Some(last) = messages.pop() {
+    fn drain_op_messages(&mut self) -> bool {
+        let last = {
+            let mut messages = self.ops.messages.lock().expect("ops lock");
+            let last = messages.pop();
+            messages.clear();
+            last
+        };
+        if let Some(last) = last {
             self.status = last;
+            return true;
         }
-        messages.clear();
+        false
+    }
+
+    /// Refreshes all server runtime states as one periodic snapshot. The scan
+    /// runs off the UI thread: on a host with hundreds of configured servers,
+    /// even one filesystem lookup per server is enough to make key handling
+    /// visibly stall. Renderers only consult the last completed snapshot.
+    fn refresh_runtime_statuses(&mut self, force: bool) -> bool {
+        if force {
+            // If a scan is already running, remember that an operation
+            // completed during it and immediately follow it with a fresh one.
+            self.runtime_status_refresh_pending = true;
+            self.runtime_status_checked_at = None;
+        }
+
+        let mut changed = false;
+        if let Some(receiver) = self.runtime_status_scan.as_ref() {
+            match receiver.try_recv() {
+                Ok(statuses) => {
+                    self.runtime_status_scan = None;
+                    self.runtime_status_checked_at = Some(Instant::now());
+                    if statuses != self.runtime_statuses {
+                        self.runtime_statuses = statuses;
+                        changed = true;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => return false,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.runtime_status_scan = None;
+                    self.runtime_status_checked_at = Some(Instant::now());
+                }
+            }
+        }
+
+        let refresh_due = self
+            .runtime_status_checked_at
+            .is_none_or(|checked| checked.elapsed() >= RUNTIME_STATUS_REFRESH_INTERVAL);
+        if self.runtime_status_scan.is_none()
+            && (self.runtime_status_refresh_pending || refresh_due)
+        {
+            self.runtime_status_refresh_pending = false;
+            let store = self.store.clone();
+            let servers = self.config.servers.clone();
+            let (sender, receiver) = mpsc::sync_channel(1);
+            thread::spawn(move || {
+                let statuses = servers
+                    .iter()
+                    .map(|server| (server.id.clone(), process::runtime_status(&store, server)))
+                    .collect();
+                let _ = sender.send(statuses);
+            });
+            self.runtime_status_scan = Some(receiver);
+        }
+
+        changed
+    }
+
+    fn invalidate_runtime_statuses(&mut self) {
+        self.runtime_status_checked_at = None;
+        self.runtime_status_refresh_pending = true;
+    }
+
+    fn runtime_status_snapshot_ready(&self) -> bool {
+        self.runtime_status_checked_at.is_some()
+    }
+
+    fn runtime_status(&self, server: &ServerConfig) -> process::RuntimeStatus {
+        self.runtime_statuses
+            .get(&server.id)
+            .copied()
+            .unwrap_or(process::RuntimeStatus::Stopped)
+    }
+
+    fn refresh_pending_ops(&mut self) -> bool {
+        let pending = self.ops.pending.lock().expect("ops lock").clone();
+        if pending == self.pending_ops {
+            return false;
+        }
+        self.pending_ops = pending;
+        true
     }
 
     fn pending_op(&self, server_id: &str) -> Option<PendingOp> {
-        self.ops
-            .pending
-            .lock()
-            .expect("ops lock")
-            .get(server_id)
-            .copied()
+        self.pending_ops.get(server_id).copied()
     }
 
     fn target_servers(&self) -> Vec<crate::config::ServerConfig> {
-        let ids = self.marked_or_selected_server_ids();
+        let ids = self
+            .marked_or_selected_server_ids()
+            .into_iter()
+            .collect::<HashSet<_>>();
         self.config
             .servers
             .iter()
@@ -966,6 +1400,19 @@ impl App {
         self.console_attach_request.take()
     }
 
+    /// Only transient, read-only overlays expire automatically. Input forms
+    /// deliberately stay open so an idle timeout can never discard edits.
+    fn close_expired_windows(&mut self) -> bool {
+        if self.show_help
+            && window_expired(self.help_opened_at, Instant::now(), HELP_WINDOW_TIMEOUT)
+        {
+            self.show_help = false;
+            self.help_opened_at = None;
+            return true;
+        }
+        false
+    }
+
     fn toggle_details(&mut self) {
         self.show_details = !self.show_details;
         if self.show_details {
@@ -1005,10 +1452,19 @@ impl App {
         self.console_server_id = self.selected().map(|server| server.id.clone());
         self.console_lines.clear();
         self.console_wrapped.clear();
+        self.console_decoder = StreamDecoder::new();
+        self.console_decoder_preview = None;
+        self.console_has_partial_line = false;
         self.console_last_len = None;
+        self.console_last_modified = None;
+        self.console_tail_marker.clear();
         self.console_dirty = true;
         self.console_end = None;
         self.console_follow = true;
+    }
+
+    fn invalidate_console(&mut self) {
+        self.console_checked_at = None;
     }
 
     fn set_console_wrap_width(&mut self, width: usize) {
@@ -1019,44 +1475,160 @@ impl App {
         }
     }
 
-    /// Re-reads the tail of the selected server's log, but only when the
-    /// file actually grew or the selection changed. Reading the whole file
-    /// on every 200ms tick used to make the UI crawl once logs got large.
-    fn refresh_console(&mut self) {
+    /// Incrementally reads newly appended bytes from the selected server log.
+    /// A full tail reload is only needed for the initial view, truncation, or
+    /// when more than the retained tail arrived between two refreshes.
+    fn refresh_console(&mut self) -> bool {
+        if self
+            .console_checked_at
+            .is_some_and(|checked| checked.elapsed() < CONSOLE_REFRESH_INTERVAL)
+        {
+            return false;
+        }
+        self.console_checked_at = Some(Instant::now());
+
         let Some(server) = self.selected().cloned() else {
-            if !self.console_lines.is_empty() {
-                self.console_lines.clear();
-                self.console_dirty = true;
-            }
+            let changed = self.console_server_id.is_some() || !self.console_lines.is_empty();
             self.console_server_id = None;
+            self.console_lines.clear();
+            self.console_wrapped.clear();
+            self.console_decoder = StreamDecoder::new();
+            self.console_decoder_preview = None;
+            self.console_has_partial_line = false;
             self.console_last_len = None;
-            return;
+            self.console_last_modified = None;
+            self.console_tail_marker.clear();
+            self.console_dirty |= changed;
+            return changed;
         };
+        let mut changed = false;
         if self.console_server_id.as_deref() != Some(server.id.as_str()) {
             self.reset_console_for_selection();
+            changed = true;
         }
+
         let path = process::minecraft_log_path_for(&self.store, &server);
-        let len = fs::metadata(&path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        if self.console_last_len == Some(len) {
+        let metadata = fs::metadata(&path).ok();
+        let len = metadata.as_ref().map_or(0, fs::Metadata::len);
+        let modified = metadata.and_then(|metadata| metadata.modified().ok());
+        let Some(previous_len) = self.console_last_len else {
+            return self.reload_console_tail(&path) || changed;
+        };
+        if log_needs_reload(previous_len, self.console_last_modified, len, modified) {
+            return self.reload_console_tail(&path) || changed;
+        }
+        if len == previous_len {
+            return changed;
+        }
+        if len.saturating_sub(previous_len) > LOG_TAIL_BYTES {
+            return self.reload_console_tail(&path) || changed;
+        }
+
+        let Some((read, prefix_matches)) = read_log_from(
+            &path,
+            previous_len,
+            LOG_TAIL_BYTES,
+            &self.console_tail_marker,
+        ) else {
+            return changed;
+        };
+        if !prefix_matches {
+            return self.reload_console_tail(&path) || changed;
+        }
+        let LogRead {
+            end,
+            bytes,
+            tail_marker,
+            modified,
+        } = read;
+        self.console_last_len = Some(end);
+        self.console_last_modified = modified;
+        self.console_tail_marker = tail_marker;
+        changed |= self.append_console_bytes(&bytes);
+        self.trim_console_history(true);
+        self.console_dirty |= changed;
+        changed
+    }
+
+    fn reload_console_tail(&mut self, path: &Path) -> bool {
+        let had_content = !self.console_lines.is_empty();
+        self.console_lines.clear();
+        self.console_wrapped.clear();
+        self.console_decoder = StreamDecoder::new();
+        self.console_decoder_preview = None;
+        self.console_has_partial_line = false;
+
+        let LogRead {
+            end,
+            bytes,
+            tail_marker,
+            modified,
+        } = read_log_tail_bytes(path, LOG_TAIL_BYTES).unwrap_or_default();
+        self.console_last_len = Some(end);
+        self.console_last_modified = modified;
+        self.console_tail_marker = tail_marker;
+        let appended = self.append_console_bytes(&bytes);
+        self.trim_console_history(false);
+        let changed = had_content || appended;
+        self.console_dirty = true;
+        changed
+    }
+
+    fn trim_console_history(&mut self, preserve_scroll_anchor: bool) {
+        if self.console_lines.len() <= MAX_CONSOLE_LINES {
             return;
         }
-        self.console_last_len = Some(len);
-        let content = read_log_tail(&path, LOG_TAIL_BYTES).unwrap_or_default();
-        self.console_lines = content.lines().map(ToString::to_string).collect();
-        if self.console_lines.len() > MAX_CONSOLE_LINES {
-            let keep_from = self.console_lines.len() - MAX_CONSOLE_LINES;
-            self.console_lines.drain(..keep_from);
+        let keep_from = self.console_lines.len() - MAX_CONSOLE_LINES;
+        if preserve_scroll_anchor && !self.console_follow {
+            let removed_visual_lines =
+                wrap_console_lines(&self.console_lines[..keep_from], self.console_wrap_width).len();
+            self.console_end = self
+                .console_end
+                .map(|end| end.saturating_sub(removed_visual_lines).max(1));
         }
-        self.console_dirty = true;
+        self.console_lines.drain(..keep_from);
+    }
+
+    fn append_console_bytes(&mut self, bytes: &[u8]) -> bool {
+        let mut changed = self.remove_console_decoder_preview();
+        let text = self.console_decoder.push(bytes);
+        changed |= append_console_text(
+            &mut self.console_lines,
+            &mut self.console_has_partial_line,
+            &text,
+        );
+
+        let preview = self.console_decoder.pending_preview();
+        if !preview.is_empty() {
+            changed |= append_console_text(
+                &mut self.console_lines,
+                &mut self.console_has_partial_line,
+                &preview,
+            );
+            self.console_decoder_preview = Some(preview);
+        }
+        changed
+    }
+
+    fn remove_console_decoder_preview(&mut self) -> bool {
+        let Some(preview) = self.console_decoder_preview.take() else {
+            return false;
+        };
+        let Some(line) = self.console_lines.last_mut() else {
+            return false;
+        };
+        if !line.ends_with(&preview) {
+            return false;
+        }
+        line.truncate(line.len() - preview.len());
+        true
     }
 
     /// Rewraps the cached log lines when the content or panel width changed.
     /// Wrapping thousands of lines is too expensive to redo on every frame.
-    fn ensure_wrapped(&mut self) {
+    fn ensure_wrapped(&mut self) -> bool {
         if !self.console_dirty {
-            return;
+            return false;
         }
         self.console_wrapped = wrap_console_lines(&self.console_lines, self.console_wrap_width);
         self.console_dirty = false;
@@ -1066,6 +1638,7 @@ impl App {
             let len = self.console_wrapped.len();
             self.console_end = self.console_end.map(|end| end.min(len).max(1));
         }
+        true
     }
 
     fn console_visible_lines(&self, height: usize) -> Vec<Line<'static>> {
@@ -1196,31 +1769,138 @@ impl App {
         i18n::text(self.language, key)
     }
 
-    fn save(&self) -> Result<()> {
-        self.store.save(&self.config)
+    fn save(&mut self) -> Result<()> {
+        self.store.save(&self.config)?;
+        self.config_signature = self.store.signature();
+        self.config_checked_at = Some(Instant::now());
+        Ok(())
     }
+}
+
+#[derive(Default)]
+struct LogRead {
+    end: u64,
+    bytes: Vec<u8>,
+    tail_marker: Vec<u8>,
+    modified: Option<SystemTime>,
+}
+
+fn log_needs_reload(
+    previous_len: u64,
+    previous_modified: Option<SystemTime>,
+    len: u64,
+    modified: Option<SystemTime>,
+) -> bool {
+    len < previous_len || (len == previous_len && modified != previous_modified)
+}
+
+fn log_tail_marker(bytes: &[u8]) -> Vec<u8> {
+    bytes[bytes.len().saturating_sub(LOG_TAIL_MARKER_BYTES)..].to_vec()
 }
 
 /// Reads up to `tail_bytes` from the end of `path`, dropping a leading
 /// partial line when the read did not start at the beginning of the file.
-fn read_log_tail(path: &Path, tail_bytes: u64) -> Option<String> {
+/// The returned offset always points to the end of all bytes read, including
+/// a dropped prefix, so the next incremental read never repeats data.
+fn read_log_tail_bytes(path: &Path, tail_bytes: u64) -> Option<LogRead> {
     let mut file = File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
+    let metadata = file.metadata().ok()?;
+    let len = metadata.len();
+    let modified = metadata.modified().ok();
     let offset = len.saturating_sub(tail_bytes);
     file.seek(SeekFrom::Start(offset)).ok()?;
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf).ok()?;
+    file.take(len.saturating_sub(offset))
+        .read_to_end(&mut buf)
+        .ok()?;
+    let end = offset.saturating_add(buf.len() as u64);
+    let tail_marker = log_tail_marker(&buf);
     // Drop the leading partial line before decoding: a tail read that starts
     // mid-character would otherwise make strict UTF-8 validation fail for the
     // whole buffer and misroute clean UTF-8 logs into the legacy fallback.
-    let mut bytes = buf.as_slice();
     if offset > 0 {
-        match bytes.iter().position(|byte| *byte == b'\n') {
-            Some(newline) => bytes = &bytes[newline + 1..],
-            None => bytes = &[],
-        }
+        let keep_from = buf
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(buf.len(), |newline| newline + 1);
+        buf.drain(..keep_from);
     }
-    Some(crate::encoding::decode_console_bytes(bytes))
+    Some(LogRead {
+        end,
+        bytes: buf,
+        tail_marker,
+        modified,
+    })
+}
+
+fn read_log_from(
+    path: &Path,
+    offset: u64,
+    max_bytes: u64,
+    expected_tail: &[u8],
+) -> Option<(LogRead, bool)> {
+    let mut file = File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    let len = metadata.len();
+    let modified = metadata.modified().ok();
+    let read_len = len.checked_sub(offset)?;
+    if read_len > max_bytes {
+        return None;
+    }
+    let start = offset.saturating_sub(expected_tail.len() as u64);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    file.take(len.saturating_sub(start))
+        .read_to_end(&mut buf)
+        .ok()?;
+    let end = start.saturating_add(buf.len() as u64);
+    let prefix_matches = buf.starts_with(expected_tail);
+    let tail_marker = log_tail_marker(&buf);
+    let bytes = if prefix_matches {
+        buf[expected_tail.len()..].to_vec()
+    } else {
+        Vec::new()
+    };
+    Some((
+        LogRead {
+            end,
+            bytes,
+            tail_marker,
+            modified,
+        },
+        prefix_matches,
+    ))
+}
+
+/// Appends decoded stream text while preserving an unfinished final line so
+/// that a later chunk can extend it instead of creating a duplicate row.
+fn append_console_text(lines: &mut Vec<String>, has_partial_line: &mut bool, text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+
+    let mut combined = String::new();
+    if *has_partial_line {
+        combined = lines.pop().unwrap_or_default();
+    }
+    combined.push_str(text);
+
+    let ends_with_newline = combined.ends_with('\n');
+    let mut parts = combined.split('\n').peekable();
+    while let Some(part) = parts.next() {
+        let is_final = parts.peek().is_none();
+        if is_final && ends_with_newline {
+            break;
+        }
+        let line = if is_final {
+            part
+        } else {
+            part.strip_suffix('\r').unwrap_or(part)
+        };
+        lines.push(line.to_string());
+    }
+    *has_partial_line = !ends_with_newline;
+    true
 }
 
 fn op_progress_message(language: Language, op: PendingOp, servers: &[ServerConfig]) -> String {
@@ -1270,5 +1950,166 @@ fn candidate_status_message(language: Language, candidates: &[String]) -> String
     match language {
         Language::English => format!("{} matches: {list}", candidates.len()),
         Language::ChineseSimplified => format!("{} 个匹配项：{list}", candidates.len()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, OpenOptions};
+    use std::io::Write as _;
+    use std::time::{Duration, Instant, UNIX_EPOCH};
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::{
+        append_console_text, is_delete_shortcut, log_needs_reload, read_log_from,
+        read_log_tail_bytes, window_expired, HELP_WINDOW_TIMEOUT, LOG_TAIL_BYTES,
+    };
+
+    #[cfg(unix)]
+    use super::has_terminal_hangup;
+
+    #[test]
+    fn deletion_requires_control_and_d_together() {
+        assert!(!is_delete_shortcut(&KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::NONE,
+        )));
+        assert!(!is_delete_shortcut(&KeyEvent::new(
+            KeyCode::Char('D'),
+            KeyModifiers::SHIFT,
+        )));
+        assert!(is_delete_shortcut(&KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_hangup_flags_are_detected_without_treating_input_as_closed() {
+        assert!(has_terminal_hangup(libc::POLLHUP));
+        assert!(has_terminal_hangup(libc::POLLERR));
+        assert!(has_terminal_hangup(libc::POLLNVAL));
+        assert!(!has_terminal_hangup(libc::POLLIN));
+    }
+
+    #[test]
+    fn transient_window_expires_at_its_deadline() {
+        let opened = Instant::now();
+
+        assert!(!window_expired(
+            None,
+            opened + HELP_WINDOW_TIMEOUT,
+            HELP_WINDOW_TIMEOUT,
+        ));
+        assert!(!window_expired(
+            Some(opened),
+            opened + Duration::from_secs(9),
+            HELP_WINDOW_TIMEOUT,
+        ));
+        assert!(window_expired(
+            Some(opened),
+            opened + HELP_WINDOW_TIMEOUT,
+            HELP_WINDOW_TIMEOUT,
+        ));
+    }
+
+    #[test]
+    fn console_text_extends_the_previous_partial_line() {
+        let mut lines = Vec::new();
+        let mut partial = false;
+
+        assert!(append_console_text(
+            &mut lines,
+            &mut partial,
+            "first\npartial",
+        ));
+        assert_eq!(lines, vec!["first".to_string(), "partial".to_string()]);
+        assert!(partial);
+
+        assert!(append_console_text(&mut lines, &mut partial, " line\nnext",));
+        assert_eq!(
+            lines,
+            vec![
+                "first".to_string(),
+                "partial line".to_string(),
+                "next".to_string(),
+            ]
+        );
+        assert!(partial);
+
+        assert!(append_console_text(&mut lines, &mut partial, "\n"));
+        assert_eq!(
+            lines,
+            vec![
+                "first".to_string(),
+                "partial line".to_string(),
+                "next".to_string(),
+            ]
+        );
+        assert!(!partial);
+    }
+
+    #[test]
+    fn console_text_preserves_blank_lines_and_normalizes_crlf() {
+        let mut lines = Vec::new();
+        let mut partial = false;
+
+        append_console_text(&mut lines, &mut partial, "one\r\n\nthree\r");
+
+        assert_eq!(
+            lines,
+            vec!["one".to_string(), "".to_string(), "three\r".to_string()]
+        );
+        assert!(partial);
+    }
+
+    #[test]
+    fn console_text_preserves_standalone_carriage_return_redraws() {
+        let mut lines = Vec::new();
+        let mut partial = false;
+
+        append_console_text(&mut lines, &mut partial, "10%\r");
+        append_console_text(&mut lines, &mut partial, "20%\r");
+
+        assert_eq!(lines, vec!["10%\r20%\r".to_string()]);
+        assert!(partial);
+    }
+
+    #[test]
+    fn same_length_log_rewrite_requires_a_reload() {
+        let first = UNIX_EPOCH + Duration::from_secs(1);
+        let second = first + Duration::from_secs(1);
+
+        assert!(!log_needs_reload(128, Some(first), 128, Some(first)));
+        assert!(log_needs_reload(128, Some(first), 128, Some(second)));
+        assert!(log_needs_reload(128, Some(first), 64, Some(second)));
+        assert!(!log_needs_reload(128, Some(first), 256, Some(second)));
+    }
+
+    #[test]
+    fn incremental_log_read_detects_truncate_and_regrow() {
+        let path =
+            std::env::temp_dir().join(format!("remiaft-log-cursor-{}", uuid::Uuid::new_v4()));
+        fs::write(&path, b"old line\nold tail\n").unwrap();
+        let initial = read_log_tail_bytes(&path, LOG_TAIL_BYTES).unwrap();
+
+        let mut writer = OpenOptions::new().append(true).open(&path).unwrap();
+        writer.write_all(b"appended\n").unwrap();
+        writer.flush().unwrap();
+        let (appended, prefix_matches) =
+            read_log_from(&path, initial.end, LOG_TAIL_BYTES, &initial.tail_marker).unwrap();
+        assert!(prefix_matches);
+        assert_eq!(appended.bytes, b"appended\n");
+
+        drop(writer);
+        let replacement_len = appended.end as usize + 32;
+        fs::write(&path, vec![b'x'; replacement_len]).unwrap();
+        let (_, prefix_matches) =
+            read_log_from(&path, appended.end, LOG_TAIL_BYTES, &appended.tail_marker).unwrap();
+        assert!(!prefix_matches);
+
+        fs::remove_file(path).unwrap();
     }
 }

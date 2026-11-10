@@ -67,7 +67,14 @@ fn install_platform_handlers() {
 }
 
 #[cfg(unix)]
-extern "C" fn handle_unix_signal(_signal: libc::c_int) {
+extern "C" fn handle_unix_signal(signal: libc::c_int) {
+    if signal == libc::SIGHUP {
+        // A lost SSH/web terminal can leave crossterm spinning inside its
+        // internal event reader, so the normal loop never observes the
+        // shutdown flag. The terminal is already gone at this point and
+        // _exit is async-signal-safe; terminate only this UI/attach process.
+        unsafe { libc::_exit(0) };
+    }
     request();
 }
 
